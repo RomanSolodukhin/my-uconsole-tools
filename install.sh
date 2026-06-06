@@ -23,6 +23,17 @@ echo ">> /etc (configs 0644)"
 # NetworkManager dispatcher scripts must be executable
 sudo chmod 0755 /etc/NetworkManager/dispatcher.d/90-net-marquee
 
+echo ">> shutdown-warning sound (generated, not vendored)"
+sudo mkdir -p /usr/local/share/uconsole
+[ -f /usr/local/share/uconsole/shutdown-warn.wav ] || sudo ffmpeg -y -loglevel error \
+  -f lavfi -i "sine=frequency=880:duration=0.18" \
+  -f lavfi -i "sine=frequency=660:duration=0.18" \
+  -f lavfi -i "sine=frequency=440:duration=0.22" \
+  -f lavfi -i "anullsrc=r=44100:cl=mono:d=0.07" \
+  -f lavfi -i "anullsrc=r=44100:cl=mono:d=0.07" \
+  -filter_complex "[0][3][1][4][2]concat=n=5:v=0:a=1,volume=1.0" \
+  /usr/local/share/uconsole/shutdown-warn.wav
+
 echo ">> tmux-resurrect plugin"
 [ -d "$HOME/.tmux/plugins/tmux-resurrect" ] || \
   git clone --depth 1 https://github.com/tmux-plugins/tmux-resurrect "$HOME/.tmux/plugins/tmux-resurrect"

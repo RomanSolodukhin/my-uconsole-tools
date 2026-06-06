@@ -3,8 +3,9 @@
 # economy pref ON + on battery: CPU powersave + dim screen after IDLE_DIM (input idle).
 # Auto-shutdown on battery when there has been no input AND no network traffic for the
 # threshold (network activity resets the SHUTDOWN timer but NOT the dim timer); low/critical
-# battery in eco shuts down on input-idle alone. Warning window cancellable by any input.
-# On AC: never shut down; unplugging starts fresh timers. See ~/Documents/uconsole-power-plan.md.
+# battery in eco shuts down on input-idle alone. Warning window (with a sound at its start)
+# cancellable by any input. On AC: never shut down; unplugging starts fresh timers.
+# See ~/Documents/uconsole-power-plan.md.
 
 CONF=/etc/uconsole-power.conf
 PREF=/home/roman/.config/uconsole/economy
@@ -12,11 +13,13 @@ AC=/sys/class/power_supply/axp22x-ac/online
 BATTERY=/sys/class/power_supply/axp20x-battery/capacity
 GOV=/sys/devices/system/cpu/cpufreq/policy0/scaling_governor
 SAVE=/usr/local/bin/tmux-resurrect-save
+RUNUID=$(id -u roman 2>/dev/null || echo 1000)
 
 # defaults (overridden by conf)
 IDLE_DIM=90; DIM_LEVEL=1; CPU_GOVERNOR=powersave; NORMAL_GOVERNOR=ondemand; TICK=5
 SHUTDOWN_IDLE_ECO=600; SHUTDOWN_IDLE_NORMAL=900; SHUTDOWN_BATT_OVERRIDE=50; BATT_CRITICAL=5
 NET_RATE=20480; NET_QUIET=120; SHUTDOWN_WARN=60; WIFI_PS=on; DRY_RUN=1
+WARN_SOUND=/usr/local/share/uconsole/shutdown-warn.wav
 [ -r "$CONF" ] && . "$CONF"
 
 dimmed=0; saved_bri=""; warn_since=0; was_on_ac=1
@@ -31,6 +34,10 @@ net_dev()    { ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($
 
 set_gov()        { [ "$(cat "$GOV" 2>/dev/null)" = "$1" ] || echo "$1" > "$GOV" 2>/dev/null; }
 assert_wifi_ps() { [ "$WIFI_PS" = "on" ] && iw dev wlan0 set power_save on 2>/dev/null; return 0; }
+play_warn() {
+  [ -n "$WARN_SOUND" ] && [ -r "$WARN_SOUND" ] || return 0
+  runuser -u roman -- env XDG_RUNTIME_DIR="/run/user/$RUNUID" pw-play "$WARN_SOUND" >/dev/null 2>&1 &
+}
 
 dim() {
   [ "$dimmed" = "1" ] && return
@@ -90,7 +97,6 @@ evaluate() {
   sample_net
   if ! on_battery; then was_on_ac=1; restore_all; return; fi
 
-  # Just unplugged: start fresh idle + network timers.
   if [ "$was_on_ac" = "1" ]; then
     last=$(now); last_net_active=$(now); was_on_ac=0
   fi
@@ -98,9 +104,9 @@ evaluate() {
   local eco=off; [ "$(read_pref)" = "on" ] && eco=on
   local t b input_idle shut_idle la want=0
   t=$(now); b=$(batt); [ -z "$b" ] && b=100
-  input_idle=$(( t - last ))                       # input only -> drives dim + battery branches
+  input_idle=$(( t - last ))
   la=$last; [ "$last_net_active" -gt "$la" ] && la=$last_net_active
-  shut_idle=$(( t - la ))                          # input OR traffic -> drives quiet shutdown
+  shut_idle=$(( t - la ))
 
   if [ "$eco" = "on" ]; then
     set_gov "$CPU_GOVERNOR"; assert_wifi_ps
@@ -111,11 +117,11 @@ evaluate() {
 
   if [ "$eco" = "on" ]; then
     if [ "$b" -le "$BATT_CRITICAL" ]; then
-      want=1                                                            # crit: immediate
+      want=1
     elif [ "$input_idle" -ge "$SHUTDOWN_IDLE_ECO" ] && [ "$b" -lt "$SHUTDOWN_BATT_OVERRIDE" ]; then
-      want=1                                                            # low batt: input-idle, ignore traffic
+      want=1
     elif [ "$shut_idle" -ge "$SHUTDOWN_IDLE_ECO" ]; then
-      want=1                                                            # truly idle (no input AND no traffic)
+      want=1
     fi
   else
     if [ "$SHUTDOWN_IDLE_NORMAL" -gt 0 ] && [ "$shut_idle" -ge "$SHUTDOWN_IDLE_NORMAL" ]; then
@@ -125,7 +131,7 @@ evaluate() {
 
   if [ "$want" = "1" ]; then
     if [ "$warn_since" = "0" ]; then
-      warn_since="$t"; notify_warn "$SHUTDOWN_WARN"
+      warn_since="$t"; play_warn; notify_warn "$SHUTDOWN_WARN"
     elif [ $(( t - warn_since )) -ge "$SHUTDOWN_WARN" ]; then
       do_shutdown
     else
@@ -141,10 +147,10 @@ exec 3< <(libinput debug-events 2>/dev/null)
 evaluate
 while :; do
   if IFS= read -t "$TICK" -r -u 3 line; then
-    last=$(now); undim; cancel_warn      # активность: wake + отмена предупреждения
+    last=$(now); undim; cancel_warn
   else
     rc=$?
-    [ "$rc" -le 128 ] && exit 1          # EOF: libinput умер -> рестарт от systemd
+    [ "$rc" -le 128 ] && exit 1
     evaluate
   fi
 done
