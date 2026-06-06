@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+
+set -u
+
+EVENT=/run/net-status-event   # written by NM dispatcher on connect: "<epoch>\t<ssid>"
+WINDOW=5                       # seconds to scroll the SSID after connect
+FRAME=0.3                      # seconds per scroll step (~3 fps)
+MWIDTH=12                      # marquee window width (chars)
+GAP="   "                     # gap between repeats of the SSID
+
+primary_type=""
+primary_name=""
+primary_kind=""
+fallback_type=""
+fallback_name=""
+fallback_kind=""
+
+while IFS=: read -r device type state connection; do
+  [ "$state" = "connected" ] || continue
+  [ "$device" = "lo" ] && continue
+  [ "$type" = "loopback" ] && continue
+  [ "$type" = "wifi-p2p" ] && continue
+
+  case "$type" in
+    wifi)
+      label="WiFi"
+      name="$connection"
+      ;;
+    ethernet)
+      label="ETH"
+      name="$device"
+      ;;
+    gsm|wwan)
+      label="4G"
+      name="$connection"
+      ;;
+    *)
+      label="${type^^}"
+      name="${connection:-$device}"
+      ;;
+  esac
+
+  if ip route show default 2>/dev/null | grep -q " dev ${device} "; then
+    primary_type="$label"
+    primary_name="$name"
+    primary_kind="$type"
+    break
+  fi
+
+  if [ -z "$fallback_type" ]; then
+    fallback_type="$label"
+    fallback_name="$name"
+    fallback_kind="$type"
+  fi
+done < <(nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status 2>/dev/null)
+
+if [ -n "$primary_type" ]; then
+  ptype="$primary_type"; pname="$primary_name"; pkind="$primary_kind"
+elif [ -n "$fallback_type" ]; then
+  ptype="$fallback_type"; pname="$fallback_name"; pkind="$fallback_kind"
+else
+  printf 'NET down\n'
+  exit 0
+fi
+
+# Wi-Fi: scroll the SSID for WINDOW seconds right after connecting, then collapse
+# to just the "WiFi" label. The scroll offset is derived purely from how much
+# time has passed since the connect event, so the cell animates as long as the
+# status bar is being redrawn (the dispatcher drives ~3 refreshes/sec for WINDOW).
+if [ "$pkind" = "wifi" ] && [ -r "$EVENT" ]; then
+  IFS=$'\t' read -r ev_epoch ev_ssid < "$EVENT"
+  now=$(date +%s.%N)
+  read -r inwin frame < <(awk -v now="$now" -v ev="${ev_epoch:-0}" -v w="$WINDOW" -v fr="$FRAME" \
+    'BEGIN{ e = now - ev; printf "%d %d", (e >= 0 && e < w) ? 1 : 0, (e < 0 ? 0 : int(e / fr)) }')
+
+  if [ "$inwin" = "1" ] && [ "$ev_ssid" = "$pname" ]; then
+    track="${pname}${GAP}"
+    n=${#track}
+    off=$(( frame % n ))
+    double="${track}${track}"
+    printf '%s\n' "${double:off:MWIDTH}"
+    exit 0
+  fi
+fi
+
+# Wi-Fi collapses to just the label (the SSID already scrolled on connect);
+# wired/cellular keep their name so you can tell which link/connection is up.
+if [ "$pkind" = "wifi" ]; then
+  printf '%s\n' "$ptype"
+else
+  printf '%s %s\n' "$ptype" "$pname"
+fi

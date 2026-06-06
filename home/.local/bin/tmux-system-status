@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+
+bri=$(/home/roman/.local/bin/brightness-status 2>/dev/null || printf 'BRT ?')
+net=$(/home/roman/.local/bin/network-status 2>/dev/null || printf 'NET ?')
+tmp=$(/home/roman/.local/bin/cm5-temp 2>/dev/null || printf 'CPU ?')
+
+printf '%s▒%s▒%s\n' "$bri" "$net" "$tmp"

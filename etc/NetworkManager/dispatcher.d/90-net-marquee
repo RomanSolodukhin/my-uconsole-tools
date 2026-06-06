@@ -1,0 +1,29 @@
+#!/bin/sh
+# On Wi-Fi connect: record connect time + SSID, then drive the tmux status bar
+# to repaint ~3x/sec for a few seconds so network-status can scroll the SSID.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+iface="$1"
+action="$2"
+[ "$action" = "up" ] || exit 0
+
+# Wi-Fi interfaces only
+{ [ -d "/sys/class/net/$iface/wireless" ] || [ -e "/sys/class/net/$iface/phy80211" ]; } || exit 0
+
+ssid="${CONNECTION_ID:-$iface}"
+printf '%s\t%s\n' "$(date +%s)" "$ssid" > /run/net-status-event
+chown roman:roman /run/net-status-event 2>/dev/null
+chmod 0664 /run/net-status-event 2>/dev/null
+
+# Animate the marquee for ~5.4s, then one final repaint to draw the collapsed label.
+setsid sh -c '
+  i=0
+  while [ "$i" -lt 18 ]; do
+    runuser -u roman -- tmux refresh-client -S 2>/dev/null
+    i=$((i + 1))
+    sleep 0.3
+  done
+  runuser -u roman -- tmux refresh-client -S 2>/dev/null
+' </dev/null >/dev/null 2>&1 &
+
+exit 0

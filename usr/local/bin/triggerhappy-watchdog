@@ -1,0 +1,13 @@
+#!/bin/sh
+# triggerhappy (thd) silently drops input devices on a read error — e.g. when the
+# uConsole keyboard MCU re-enumerates after a USB/power glitch (Maple bootloader) —
+# and never reopens them. Follow its journal and restart it so the keys keep working.
+journalctl -u triggerhappy.service -n0 -f -o cat | while IFS= read -r line; do
+  case "$line" in
+    *"Error reading device"*)
+      logger -t triggerhappy-watchdog "thd lost a device -> restarting triggerhappy"
+      systemctl restart triggerhappy.service
+      sleep 10   # debounce so we don't restart-storm if a device is truly gone
+      ;;
+  esac
+done

@@ -1,0 +1,150 @@
+#!/bin/bash
+# uConsole economy-mode engine (Phases 1+3).
+# economy pref ON + on battery: CPU powersave + dim screen after IDLE_DIM (input idle).
+# Auto-shutdown on battery when there has been no input AND no network traffic for the
+# threshold (network activity resets the SHUTDOWN timer but NOT the dim timer); low/critical
+# battery in eco shuts down on input-idle alone. Warning window cancellable by any input.
+# On AC: never shut down; unplugging starts fresh timers. See ~/Documents/uconsole-power-plan.md.
+
+CONF=/etc/uconsole-power.conf
+PREF=/home/roman/.config/uconsole/economy
+AC=/sys/class/power_supply/axp22x-ac/online
+BATTERY=/sys/class/power_supply/axp20x-battery/capacity
+GOV=/sys/devices/system/cpu/cpufreq/policy0/scaling_governor
+SAVE=/usr/local/bin/tmux-resurrect-save
+
+# defaults (overridden by conf)
+IDLE_DIM=90; DIM_LEVEL=1; CPU_GOVERNOR=powersave; NORMAL_GOVERNOR=ondemand; TICK=5
+SHUTDOWN_IDLE_ECO=600; SHUTDOWN_IDLE_NORMAL=900; SHUTDOWN_BATT_OVERRIDE=50; BATT_CRITICAL=5
+NET_RATE=20480; NET_QUIET=120; SHUTDOWN_WARN=60; WIFI_PS=on; DRY_RUN=1
+[ -r "$CONF" ] && . "$CONF"
+
+dimmed=0; saved_bri=""; warn_since=0; was_on_ac=1
+last_net_active=0; prev_rx=-1; prev_tx=-1; prev_dev=""; prev_t=0
+
+now()        { date +%s; }
+read_pref()  { [ -r "$PREF" ] && tr -d '[:space:]' < "$PREF" || echo off; }
+on_battery() { [ "$(cat "$AC" 2>/dev/null)" = "0" ]; }
+batt()       { cat "$BATTERY" 2>/dev/null; }
+refresh_bar(){ runuser -u roman -- tmux refresh-client -S 2>/dev/null || true; }
+net_dev()    { ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'; }
+
+set_gov()        { [ "$(cat "$GOV" 2>/dev/null)" = "$1" ] || echo "$1" > "$GOV" 2>/dev/null; }
+assert_wifi_ps() { [ "$WIFI_PS" = "on" ] && iw dev wlan0 set power_save on 2>/dev/null; return 0; }
+
+dim() {
+  [ "$dimmed" = "1" ] && return
+  saved_bri=$(brightnessctl -d backlight@0 get 2>/dev/null)
+  brightnessctl -q -d backlight@0 set "$DIM_LEVEL" 2>/dev/null
+  dimmed=1; refresh_bar
+}
+undim() {
+  [ "$dimmed" = "1" ] || return
+  [ -n "$saved_bri" ] && brightnessctl -q -d backlight@0 set "$saved_bri" 2>/dev/null
+  dimmed=0; refresh_bar
+}
+notify_warn() {
+  undim
+  runuser -u roman -- tmux display-message -d 0 "POWER OFF in ${1}s - press a key to cancel" 2>/dev/null || true
+}
+cancel_warn() {
+  [ "$warn_since" = "0" ] && return
+  warn_since=0
+  refresh_bar   # redraw status -> clears the display-message overlay
+}
+do_shutdown() {
+  if [ "$DRY_RUN" = "1" ]; then
+    logger -t uconsole-powerd "DRY: would save session + poweroff (eco=$(read_pref) batt=$(batt))"
+    cancel_warn
+    last=$(now)   # avoid re-trigger spam every tick during dry-run
+    return
+  fi
+  logger -t uconsole-powerd "idle/critical -> saving session + poweroff"
+  "$SAVE"
+  systemctl poweroff
+}
+restore_all() { undim; set_gov "$NORMAL_GOVERNOR"; cancel_warn; }
+
+sample_net() {
+  local dev rx tx t db dt rate
+  t=$(now); dev=$(net_dev)
+  if [ -z "$dev" ]; then prev_dev=""; return; fi   # no default route -> treat as quiet
+  rx=$(cat "/sys/class/net/$dev/statistics/rx_bytes" 2>/dev/null)
+  tx=$(cat "/sys/class/net/$dev/statistics/tx_bytes" 2>/dev/null)
+  [ -z "$rx" ] && return
+  if [ "$dev" != "$prev_dev" ] || [ "$prev_rx" -lt 0 ]; then
+    prev_dev="$dev"; prev_rx="$rx"; prev_tx="$tx"; prev_t="$t"; return
+  fi
+  dt=$(( t - prev_t )); [ "$dt" -le 0 ] && dt=1
+  db=$(( (rx - prev_rx) + (tx - prev_tx) )); [ "$db" -lt 0 ] && db=0
+  rate=$(( db / dt ))
+  prev_rx="$rx"; prev_tx="$tx"; prev_t="$t"
+  [ "$rate" -gt "$NET_RATE" ] && last_net_active="$t"
+}
+
+trap 'exit 0'      TERM INT
+trap 'restore_all' EXIT
+trap ':'           USR1
+
+evaluate() {
+  sample_net
+  if ! on_battery; then was_on_ac=1; restore_all; return; fi
+
+  # Just unplugged: start fresh idle + network timers.
+  if [ "$was_on_ac" = "1" ]; then
+    last=$(now); last_net_active=$(now); was_on_ac=0
+  fi
+
+  local eco=off; [ "$(read_pref)" = "on" ] && eco=on
+  local t b input_idle shut_idle la want=0
+  t=$(now); b=$(batt); [ -z "$b" ] && b=100
+  input_idle=$(( t - last ))                       # input only -> drives dim + battery branches
+  la=$last; [ "$last_net_active" -gt "$la" ] && la=$last_net_active
+  shut_idle=$(( t - la ))                          # input OR traffic -> drives quiet shutdown
+
+  if [ "$eco" = "on" ]; then
+    set_gov "$CPU_GOVERNOR"; assert_wifi_ps
+    if [ "$input_idle" -ge "$IDLE_DIM" ] && [ "$warn_since" = "0" ]; then dim; fi
+  else
+    set_gov "$NORMAL_GOVERNOR"
+  fi
+
+  if [ "$eco" = "on" ]; then
+    if [ "$b" -le "$BATT_CRITICAL" ]; then
+      want=1                                                            # crit: immediate
+    elif [ "$input_idle" -ge "$SHUTDOWN_IDLE_ECO" ] && [ "$b" -lt "$SHUTDOWN_BATT_OVERRIDE" ]; then
+      want=1                                                            # low batt: input-idle, ignore traffic
+    elif [ "$shut_idle" -ge "$SHUTDOWN_IDLE_ECO" ]; then
+      want=1                                                            # truly idle (no input AND no traffic)
+    fi
+  else
+    if [ "$SHUTDOWN_IDLE_NORMAL" -gt 0 ] && [ "$shut_idle" -ge "$SHUTDOWN_IDLE_NORMAL" ]; then
+      want=1
+    fi
+  fi
+
+  if [ "$want" = "1" ]; then
+    if [ "$warn_since" = "0" ]; then
+      warn_since="$t"; notify_warn "$SHUTDOWN_WARN"
+    elif [ $(( t - warn_since )) -ge "$SHUTDOWN_WARN" ]; then
+      do_shutdown
+    else
+      notify_warn $(( SHUTDOWN_WARN - (t - warn_since) ))
+    fi
+  else
+    cancel_warn
+  fi
+}
+
+last=$(now); last_net_active=$(now)
+exec 3< <(libinput debug-events 2>/dev/null)
+evaluate
+while :; do
+  if IFS= read -t "$TICK" -r -u 3 line; then
+    last=$(now); undim; cancel_warn      # активность: wake + отмена предупреждения
+  else
+    rc=$?
+    [ "$rc" -le 128 ] && exit 1          # EOF: libinput умер -> рестарт от systemd
+    evaluate
+  fi
+done

@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+
+set -u
+
+EVENT=/run/power-event   # written by the udev power-event handler: "<epoch>\t<AC|BAT>"
+WINDOW=5                  # seconds to scroll the message after a cable change
+FRAME=0.3                 # seconds per scroll step (~3 fps)
+MWIDTH=12                 # marquee window width (chars)
+GAP="   "                 # gap between repeats of the message
+
+cap=""
+status=""
+for p in /sys/class/power_supply/*; do
+  [ -e "$p/type" ] || continue
+  [ "$(cat "$p/type" 2>/dev/null)" = "Battery" ] || continue
+  cap=$(cat "$p/capacity" 2>/dev/null)
+  status=$(cat "$p/status" 2>/dev/null)
+  break
+done
+
+if [ -z "$cap" ]; then
+  echo "BAT ?"
+  exit 0
+fi
+
+# For WINDOW seconds after the power cable is (un)plugged, scroll a message
+# instead of the compact gauge. The udev power-event handler stamps the event
+# file and drives the repaints; offset is derived from elapsed time.
+if [ -r "$EVENT" ]; then
+  IFS=$'\t' read -r ev_epoch ev_state < "$EVENT"
+  now=$(date +%s.%N)
+  read -r inwin frame < <(awk -v now="$now" -v ev="${ev_epoch:-0}" -v w="$WINDOW" -v fr="$FRAME" \
+    'BEGIN{ e = now - ev; printf "%d %d", (e >= 0 && e < w) ? 1 : 0, (e < 0 ? 0 : int(e / fr)) }')
+
+  if [ "$inwin" = "1" ]; then
+    if [ "${ev_state:-BAT}" = "AC" ]; then
+      case "$status" in
+        Full) msg="CHARGED" ;;
+        *)    msg="CHARGING" ;;
+      esac
+    else
+      msg="ON BATTERY"
+    fi
+    track="${msg}${GAP}"
+    n=${#track}
+    off=$(( frame % n ))
+    double="${track}${track}"
+    printf '%s\n' "${double:off:MWIDTH}"
+    exit 0
+  fi
+fi
+
+case "$status" in
+  Charging)    icon="↑" ;;
+  Full)        icon="↑" ;;
+  Discharging) icon="↓" ;;
+  *)           icon="↓" ;;
+esac
+
+printf '%s%s%%\n' "$icon" "$cap"

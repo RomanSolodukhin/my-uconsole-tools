@@ -1,0 +1,5 @@
+#!/bin/sh
+# Save the tmux session via tmux-resurrect, in the tmux server's context.
+# Used by the periodic timer (Phase 2) and reused for save-on-shutdown (Phase 3).
+# No-op if no tmux server is running.
+runuser -l roman -c 'tmux run-shell "$HOME/.tmux/plugins/tmux-resurrect/scripts/save.sh"' 2>/dev/null || true

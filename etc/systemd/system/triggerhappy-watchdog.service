@@ -1,0 +1,11 @@
+[Unit]
+Description=Restart triggerhappy if it drops input devices (USB re-enumeration)
+After=triggerhappy.service
+
+[Service]
+ExecStart=/usr/local/bin/triggerhappy-watchdog
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

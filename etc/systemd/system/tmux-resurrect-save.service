@@ -1,0 +1,6 @@
+[Unit]
+Description=Save tmux session (tmux-resurrect)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/tmux-resurrect-save

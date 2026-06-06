@@ -1,0 +1,25 @@
+#!/bin/sh
+# Triggered by udev on AC power_supply change. Records the new power state +
+# timestamp, then drives the tmux status bar to repaint ~3x/sec for a few
+# seconds so battery-status can scroll a "CHARGING"/"ON BATTERY" message.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+ac=$(cat /sys/class/power_supply/axp22x-ac/online 2>/dev/null)
+[ "$ac" = "1" ] && state=AC || state=BAT
+
+printf '%s\t%s\n' "$(date +%s)" "$state" > /run/power-event
+chown roman:roman /run/power-event 2>/dev/null
+chmod 0664 /run/power-event 2>/dev/null
+
+# Nudge the economy daemon to re-evaluate immediately (target ONLY its main PID;
+# systemctl kill would also signal the libinput child and kill the daemon).
+_mp=$(systemctl show -p MainPID --value uconsole-powerd.service 2>/dev/null)
+[ -n "$_mp" ] && [ "$_mp" != "0" ] && kill -USR1 "$_mp" 2>/dev/null || true
+
+i=0
+while [ "$i" -lt 18 ]; do
+  runuser -u roman -- tmux refresh-client -S 2>/dev/null
+  i=$((i + 1))
+  sleep 0.3
+done
+runuser -u roman -- tmux refresh-client -S 2>/dev/null

@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Replay the Wi-Fi SSID marquee once, e.g. at tmux session start. Useful after a
+# reboot: the NM dispatcher fires its connect marquee before tmux is up, so this
+# re-stamps the event with "now" + the current SSID and drives the status bar to
+# repaint ~3x/sec for a few seconds. No-op when not on Wi-Fi. Runs as the user,
+# so it talks to tmux directly (no runuser needed).
+set -u
+
+EVENT=/run/net-status-event
+
+ssid=$(nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status 2>/dev/null \
+  | awk -F: '$2 == "wifi" && $3 == "connected" { print $4; exit }')
+[ -n "$ssid" ] || exit 0
+
+printf '%s\t%s\n' "$(date +%s)" "$ssid" > "$EVENT" 2>/dev/null || exit 0
+
+# Animate ~5.4s, then a final repaint to draw the collapsed label.
+(
+  i=0
+  while [ "$i" -lt 18 ]; do
+    tmux refresh-client -S 2>/dev/null
+    i=$((i + 1))
+    sleep 0.3
+  done
+  tmux refresh-client -S 2>/dev/null
+) >/dev/null 2>&1 &

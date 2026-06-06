@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+
+if command -v vcgencmd >/dev/null 2>&1; then
+  temp=$(vcgencmd measure_temp 2>/dev/null | sed -n "s/^temp=\([0-9.]*\)'C$/\1/p")
+  if [ -n "$temp" ]; then
+    printf '%s°\n' "$temp"
+    exit 0
+  fi
+fi
+
+for f in /sys/class/thermal/thermal_zone*/temp /sys/class/hwmon/hwmon*/temp*_input; do
+  [ -r "$f" ] || continue
+  raw=$(cat "$f" 2>/dev/null)
+  case "$raw" in
+    ''|*[!0-9]*) continue ;;
+  esac
+
+  if [ "$raw" -gt 1000 ]; then
+    temp=$((raw / 1000))
+  else
+    temp=$raw
+  fi
+
+  printf '%s°\n' "$temp"
+  exit 0
+done
+
+printf '?°\n'

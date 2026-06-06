@@ -1,0 +1,5 @@
+# Re-grab input devices: thd opens devices once at start via --deviceglob and
+# misses the USB keyboard if it enumerates later (boot race) or re-enumerates
+# (keyboard MCU Maple-bootloader reset). When the uConsole keyboard appears,
+# restart triggerhappy (delayed so all sibling interfaces settle first).
+ACTION=="add", SUBSYSTEM=="input", ATTRS{name}=="ClockworkPI uConsole Consumer Control", RUN+="/usr/bin/systemd-run --no-block /bin/sh -c 'sleep 2; systemctl restart triggerhappy.service'"

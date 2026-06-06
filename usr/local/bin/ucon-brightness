@@ -1,0 +1,20 @@
+#!/bin/sh
+# uConsole brightness control: step with floor protection (never reach 0),
+# then nudge tmux to refresh its status line immediately.
+dev="backlight@0"
+min=1
+cur=$(brightnessctl -d "$dev" get 2>/dev/null)
+
+case "$1" in
+  up)
+    brightnessctl -q -d "$dev" set +1
+    ;;
+  down)
+    if [ "${cur:-0}" -gt "$min" ]; then
+      brightnessctl -q -d "$dev" set 1-
+    fi
+    ;;
+esac
+
+# thd runs us as root; the tmux server belongs to roman
+runuser -u roman -- tmux refresh-client -S 2>/dev/null || true
