@@ -34,3 +34,5 @@ if [ -n "$TMUX" ] && [ -x "$HOME/.local/bin/uconsole-splash" ]; then
     fi
     unset _sp_sid _sp_flag
 fi
+
+. "$HOME/.atuin/bin/env"
