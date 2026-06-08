@@ -1,0 +1,13 @@
+[Unit]
+Description=uConsole trackball -> tmux scroll
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.local/bin/uconsole-trackball-scroll.py
+Environment=TMUX_TMPDIR=/tmp
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

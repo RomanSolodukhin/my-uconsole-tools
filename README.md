@@ -41,6 +41,16 @@ docs/uconsole-power-plan.md                               -> design doc
   `usr/local/bin/power-event`, `battery-status`.
 - tmpfiles for the `/run` event files: `etc/tmpfiles.d/{net-status,power-event,eco-event}.conf`.
 
+**Trackball scroll** (no pointer on the bare console — repurpose the ball for scrolling)
+- `home/.local/bin/uconsole-trackball-scroll.py` + `home/.config/systemd/user/uconsole-trackball-scroll.service`
+  (user service; needs `python3-evdev`, user must be in group `input`).
+- The daemon reads `/dev/input/event*` directly, so the user must be in the `input`
+  group: `sudo usermod -aG input "$USER"` (log out/in for it to take effect).
+- Reads the trackball's `REL_Y` directly (it never emits wheel events) and, per active pane:
+  feeds real SGR wheel sequences to mouse-aware apps (claude, ssh TUIs, `less`) so they
+  scroll themselves, or drives tmux `copy-mode` in a plain shell. Tunables (`UNITS_PER_LINE`,
+  `MAX_LINES`, `INVERT`) at the top of the script.
+
 **Economy mode** (see `docs/uconsole-power-plan.md` for the full design)
 - `usr/local/bin/uconsole-powerd` + service — engine: on battery, when eco is on, CPU
   `powersave` + dim screen on input-idle; auto-shutdown when idle of input **and** network

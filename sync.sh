@@ -12,9 +12,14 @@ copy() { mkdir -p "$(dirname "$2")"; cp -a "$1" "$2"; }
 copy ~/.tmux.conf     home/.tmux.conf
 copy ~/.bash_profile  home/.bash_profile
 for f in brightness-status eco-status net-marquee-trigger uconsole-eco \
-         network-status cm5-temp battery-status tmux-system-status; do
+         network-status cm5-temp battery-status tmux-system-status \
+         uconsole-trackball-scroll.py; do
   copy ~/.local/bin/"$f" home/.local/bin/"$f"
 done
+
+# --- user systemd services ---
+copy ~/.config/systemd/user/uconsole-trackball-scroll.service \
+     home/.config/systemd/user/uconsole-trackball-scroll.service
 
 # --- /usr/local/bin (root-owned scripts) ---
 for f in ucon-brightness power-event triggerhappy-watchdog uconsole-powerd tmux-resurrect-save; do

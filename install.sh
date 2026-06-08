@@ -4,11 +4,19 @@
 set -eu
 cd "$(dirname "$0")"
 
+echo ">> apt deps"
+sudo apt-get install -y python3-evdev   # trackball -> scroll daemon
+
 echo ">> home"
 install -Dm644 home/.tmux.conf    "$HOME/.tmux.conf"
 install -Dm644 home/.bash_profile "$HOME/.bash_profile"
 for f in home/.local/bin/*; do
   install -Dm755 "$f" "$HOME/.local/bin/$(basename "$f")"
+done
+
+echo ">> user systemd services"
+for f in home/.config/systemd/user/*; do
+  install -Dm644 "$f" "$HOME/.config/systemd/user/$(basename "$f")"
 done
 
 echo ">> /usr/local/bin"
@@ -46,5 +54,8 @@ sudo setupcon --force --save 2>/dev/null || true   # console font
 sudo systemctl enable --now \
   triggerhappy.service triggerhappy-watchdog.service \
   uconsole-powerd.service tmux-resurrect-save.timer
+# user service (runs as $USER, no sudo): trackball -> tmux scroll
+systemctl --user daemon-reload || true
+systemctl --user enable --now uconsole-trackball-scroll.service || true
 
 echo "done. Console font applies on next login/reboot; default economy pref starts 'off'."
