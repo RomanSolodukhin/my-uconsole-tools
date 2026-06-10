@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""kbdlayoutd — track the active console keyboard layout on the bare framebuffer.
+
+The Linux console has no notion of "layout"; Ctrl+Alt is just a keycode combo
+that the loaded keymap turns into a ShiftL_Lock / ShiftR_Lock action, and the
+cyrillic group is whichever keymap columns that lock bit selects. The kernel
+exposes neither a switch event nor the live group state, so we mirror the exact
+bit operations ourselves:
+
+  * any Ctrl held + LeftAlt  pressed  -> toggle shiftL lock
+  * any Ctrl held + RightAlt pressed  -> toggle shiftR lock
+  * layout = second group if (shiftL or shiftR) else first group
+
+Everything is read from /etc/default/keyboard (XKBLAYOUT, XKBOPTIONS) — the
+layouts, the default, and which toggle is in use are not hardcoded.
+
+Two modes:
+  --passive   just watch the real keyboard and report (zero risk, no root).
+  (default)   grab the keyboard via EVIOCGRAB and funnel it through a fresh
+              uinput device. The virtual device starts at group 0, and since we
+              are the only source of events reaching it, our counter and the
+              kernel group can never drift. Needs access to /dev/uinput (root or
+              a udev rule). EVIOCGRAB is released automatically on exit/crash.
+"""
+
+import argparse
+import os
+import signal
+import sys
+import tempfile
+import selectors
+
+from evdev import InputDevice, UInput, ecodes, list_devices
+
+CTRL_KEYS = {ecodes.KEY_LEFTCTRL, ecodes.KEY_RIGHTCTRL}
+ALT_KEYS = {ecodes.KEY_LEFTALT, ecodes.KEY_RIGHTALT}
+SHIFT_KEYS = {ecodes.KEY_LEFTSHIFT, ecodes.KEY_RIGHTSHIFT}
+RIGHT_KEYS = {ecodes.KEY_RIGHTCTRL, ecodes.KEY_RIGHTALT, ecodes.KEY_RIGHTSHIFT}
+
+# grp:<name> -> (set_a, set_b). The toggle fires once when the chord is complete
+# (at least one key from each set held), regardless of press order — that is how
+# the kernel actually behaves. set_b is the "trigger" half whose left/right side
+# selects the ShiftL vs ShiftR lock plane that holds the cyrillic group.
+SUPPORTED_TOGGLES = {
+    "ctrl_alt_toggle": (CTRL_KEYS, ALT_KEYS),
+    "alt_shift_toggle": (ALT_KEYS, SHIFT_KEYS),
+    "ctrl_shift_toggle": (CTRL_KEYS, SHIFT_KEYS),
+}
+
+
+def parse_keyboard_config(path):
+    """Pull XKBLAYOUT and the grp: toggle out of /etc/default/keyboard."""
+    layout, options = "us", ""
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith("XKBLAYOUT="):
+                    layout = line.split("=", 1)[1].strip().strip('"').strip("'")
+                elif line.startswith("XKBOPTIONS="):
+                    options = line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError as e:
+        sys.stderr.write(f"kbdlayoutd: cannot read {path}: {e}\n")
+    layouts = [l for l in layout.split(",") if l] or ["us"]
+    toggle = None
+    for opt in options.split(","):
+        if opt.startswith("grp:"):
+            toggle = opt[len("grp:"):]
+            break
+    return layouts, toggle
+
+
+def find_device(name):
+    for path in list_devices():
+        try:
+            dev = InputDevice(path)
+        except OSError:
+            continue
+        if dev.name == name:
+            return dev
+        dev.close()
+    return None
+
+
+class LayoutTracker:
+    def __init__(self, layouts, toggle, out_path, do_tmux):
+        self.layouts = layouts
+        self.out_path = out_path
+        self.do_tmux = do_tmux
+        self.held = set()       # currently-down combo keys
+        self.armed = False      # already toggled for the current chord
+        self.lock_L = False     # ShiftL lock plane (cyrillic group)
+        self.lock_R = False     # ShiftR lock plane (cyrillic group)
+        if toggle not in SUPPORTED_TOGGLES:
+            sys.stderr.write(
+                f"kbdlayoutd: toggle 'grp:{toggle}' not supported, "
+                f"falling back to ctrl_alt_toggle\n")
+            toggle = "ctrl_alt_toggle"
+        self.set_a, self.set_b = SUPPORTED_TOGGLES[toggle]
+        self.combo_keys = self.set_a | self.set_b
+        self._last = None
+        # Resume from the last written value if present. The out file lives on
+        # tmpfs (/run), so it survives a daemon restart but is gone after a
+        # reboot — exactly when the VT group is genuinely back to the default.
+        try:
+            with open(out_path) as fh:
+                saved = fh.read().strip()
+            if saved in self.layouts and saved != self.layouts[0]:
+                self.lock_L = True
+        except OSError:
+            pass
+        self.publish(force=True)
+
+    @property
+    def index(self):
+        # group 2 (the cyrillic group) is selected by either shift-lock plane
+        return 1 if (self.lock_L or self.lock_R) and len(self.layouts) > 1 else 0
+
+    @property
+    def current(self):
+        return self.layouts[self.index]
+
+    def feed(self, event):
+        """Update lock state from a key event. Returns True if layout changed.
+
+        The toggle fires once when the Ctrl+Alt chord becomes complete, in any
+        press order, and re-arms only after the chord is broken — exactly how the
+        kernel toggles the group. Autorepeat (value 2) is ignored.
+        """
+        if event.type != ecodes.EV_KEY:
+            return False
+        code, val = event.code, event.value
+        if code not in self.combo_keys:
+            return False
+        if val == 1:
+            self.held.add(code)
+        elif val == 0:
+            self.held.discard(code)
+        else:
+            return False  # autorepeat
+
+        complete = bool(self.held & self.set_a) and bool(self.held & self.set_b)
+        if complete and not self.armed:
+            self.armed = True
+            # left vs right of the trigger half picks the ShiftL/ShiftR plane
+            if self.held & self.set_b & RIGHT_KEYS:
+                self.lock_R = not self.lock_R
+            else:
+                self.lock_L = not self.lock_L
+            return self.publish()
+        if not complete:
+            self.armed = False
+        return False
+
+    def publish(self, force=False):
+        cur = self.current
+        if not force and cur == self._last:
+            return False
+        self._last = cur
+        try:
+            d = os.path.dirname(self.out_path)
+            fd, tmp = tempfile.mkstemp(dir=d, prefix=".kbd.")
+            with os.fdopen(fd, "w") as fh:
+                fh.write(cur + "\n")
+            os.replace(tmp, self.out_path)
+        except OSError as e:
+            sys.stderr.write(f"kbdlayoutd: write {self.out_path}: {e}\n")
+        if self.do_tmux:
+            os.system("tmux refresh-client -S >/dev/null 2>&1")
+        return True
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default="/etc/default/keyboard")
+    ap.add_argument("--name", default="ClockworkPI uConsole Keyboard")
+    ap.add_argument("--out",
+                    default=os.path.join(
+                        os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "kbdlayout"))
+    ap.add_argument("--grab", action="store_true",
+                    help="experimental: grab + funnel via uinput (needs root). "
+                         "Not recommended: the group lock is per-VT, so this "
+                         "adds lockout risk without improving accuracy.")
+    ap.add_argument("--tmux", action="store_true",
+                    help="run 'tmux refresh-client -S' on each change")
+    ap.add_argument("--timeout", type=float, default=0,
+                    help="auto-exit after N seconds (safety for first runs)")
+    ap.add_argument("--verbose", action="store_true")
+    args = ap.parse_args()
+
+    layouts, toggle = parse_keyboard_config(args.config)
+    dev = find_device(args.name)
+    if dev is None:
+        sys.stderr.write(f"kbdlayoutd: keyboard '{args.name}' not found\n")
+        return 1
+
+    tracker = LayoutTracker(layouts, toggle, args.out, args.tmux)
+    sys.stderr.write(
+        f"kbdlayoutd: layouts={layouts} toggle=grp:{toggle} "
+        f"mode={'grab' if args.grab else 'passive'} out={args.out}\n"
+        f"kbdlayoutd: current={tracker.current}\n")
+
+    ui = None
+    grabbed = False
+    stop = False
+
+    def handle_signal(signum, frame):
+        nonlocal stop
+        stop = True
+    for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(s, handle_signal)
+
+    deadline = None
+    sel = selectors.DefaultSelector()
+    sel.register(dev.fd, selectors.EVENT_READ)
+
+    try:
+        if args.grab:
+            ui = UInput.from_device(dev, name="kbdlayoutd-virtual-kbd")
+            dev.grab()
+            grabbed = True
+        if args.timeout > 0:
+            # selectors uses a relative timeout per wait; track an absolute one
+            import time
+            deadline = time.monotonic() + args.timeout
+
+        while not stop:
+            wait = 1.0
+            if deadline is not None:
+                import time
+                wait = deadline - time.monotonic()
+                if wait <= 0:
+                    sys.stderr.write("kbdlayoutd: timeout reached, exiting\n")
+                    break
+            if not sel.select(timeout=wait):
+                continue
+            for event in dev.read():
+                if ui is not None:
+                    ui.write_event(event)  # faithful 1:1 pass-through
+                changed = tracker.feed(event)
+                if changed and args.verbose:
+                    sys.stderr.write(f"kbdlayoutd: -> {tracker.current}\n")
+    except OSError as e:
+        sys.stderr.write(f"kbdlayoutd: {e}\n")
+    finally:
+        if grabbed:
+            try:
+                dev.ungrab()
+            except OSError:
+                pass
+        if ui is not None:
+            ui.close()
+        dev.close()
+        sys.stderr.write("kbdlayoutd: stopped, keyboard released\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

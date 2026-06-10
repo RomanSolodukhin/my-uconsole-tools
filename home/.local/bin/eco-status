@@ -1,15 +1,25 @@
 #!/usr/bin/env bash
-# Status-bar cell for economy mode. Carries its own trailing separator so that
-# when economy is OFF it prints nothing (no dangling separator). For 5s after a
-# toggle it scrolls "ECONOMY ON/OFF" (same marquee mechanism as network-status).
+# Status-bar cell for the power mode. Carries its own trailing separator so that
+# in `normal` mode it prints nothing (no dangling separator). For 5s after a mode
+# change it scrolls "MODE <NAME>" (same marquee mechanism as network-status).
+#   economy -> ECO (active, on battery) / eco (armed, on charger)
+#   headless -> HDL    router -> RTR    normal -> (nothing)
 set -u
 
 EVENT=/run/eco-event
-PREF=/home/roman/.config/uconsole/economy
+PREF_DIR=/home/roman/.config/uconsole
+MODE="$PREF_DIR/mode"
+PREF="$PREF_DIR/economy"     # legacy fallback
 AC=/sys/class/power_supply/axp22x-ac/online
 WINDOW=5; FRAME=0.3; MWIDTH=12; GAP="   "; SEP="▒"
 
-# Toggle marquee window
+read_mode() {
+  if [ -r "$MODE" ]; then tr -d '[:space:]' < "$MODE"
+  elif [ -r "$PREF" ] && [ "$(tr -d '[:space:]' < "$PREF")" = on ]; then echo economy
+  else echo normal; fi
+}
+
+# Mode-change marquee window
 if [ -r "$EVENT" ]; then
   IFS=$'\t' read -r ev_epoch ev_state < "$EVENT"
   if [ -n "${ev_epoch:-}" ]; then
@@ -17,7 +27,7 @@ if [ -r "$EVENT" ]; then
     read -r inwin frame < <(awk -v now="$now" -v ev="$ev_epoch" -v w="$WINDOW" -v fr="$FRAME" \
       'BEGIN{ e = now - ev; printf "%d %d", (e >= 0 && e < w) ? 1 : 0, (e < 0 ? 0 : int(e / fr)) }')
     if [ "$inwin" = "1" ]; then
-      msg="ECONOMY ${ev_state:-?}"
+      msg="MODE ${ev_state^^}"
       track="${msg}${GAP}"; n=${#track}; off=$(( frame % n )); double="${track}${track}"
       printf '%s%s\n' "${double:off:MWIDTH}" "$SEP"
       exit 0
@@ -26,12 +36,14 @@ if [ -r "$EVENT" ]; then
 fi
 
 # Steady state
-pref=off; [ -r "$PREF" ] && pref=$(tr -d '[:space:]' < "$PREF")
-if [ "$pref" = "on" ]; then
-  if [ "$(cat "$AC" 2>/dev/null)" = "0" ]; then
-    printf 'ECO%s\n' "$SEP"     # активен (на батарее)
-  else
-    printf 'eco%s\n' "$SEP"     # взведён (на зарядке, спит)
-  fi
-fi
-# pref off -> ничего не печатаем
+case "$(read_mode)" in
+  economy)
+    if [ "$(cat "$AC" 2>/dev/null)" = "0" ]; then
+      printf 'ECO%s\n' "$SEP"     # активен (на батарее)
+    else
+      printf 'eco%s\n' "$SEP"     # взведён (на зарядке, спит)
+    fi ;;
+  headless) printf 'HDL%s\n' "$SEP" ;;
+  router)   printf 'RTR%s\n' "$SEP" ;;
+  # normal -> ничего не печатаем
+esac

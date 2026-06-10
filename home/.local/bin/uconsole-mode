@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Select the uConsole power mode (persistent pref). Effects are applied by
+# uconsole-powerd. Modes:
+#   normal   - no economy effects (idle shutdown on battery as before)
+#   economy  - CPU powersave + idle screen dim, on battery (the common toggle)
+#   headless - (todo) screen off fast, no idle-shutdown, USB peripheral kept alive
+#   router   - (todo) headless + share uplink to the USB device
+# headless/router are command-only (NOT in `cycle`); future: triggered
+# contextually by the ESP32-S3 over its serial channel calling this same command.
+set -u
+
+PREF_DIR=/home/roman/.config/uconsole
+MODE="$PREF_DIR/mode"
+ECO="$PREF_DIR/economy"      # legacy mirror, kept in sync for safe rollback
+EVENT=/run/eco-event
+AC=/sys/class/power_supply/axp22x-ac/online
+mkdir -p "$PREF_DIR"
+
+read_mode() {
+  if [ -r "$MODE" ]; then tr -d '[:space:]' < "$MODE"
+  elif [ -r "$ECO" ] && [ "$(tr -d '[:space:]' < "$ECO")" = on ]; then echo economy
+  else echo normal; fi
+}
+
+set_mode() {  # $1 = mode name — write pref, fire marquee, poke daemon, drive refreshes
+  echo "$1" > "$MODE"
+  if [ "$1" = economy ]; then echo on > "$ECO"; else echo off > "$ECO"; fi
+  printf '%s\t%s\n' "$(date +%s)" "$1" > "$EVENT" 2>/dev/null || true
+  # Nudge the daemon (target ONLY its main PID; systemctl kill would also hit the
+  # libinput child and restart the daemon). Needs sudo as the daemon runs as root.
+  _mp=$(systemctl show -p MainPID --value uconsole-powerd.service 2>/dev/null)
+  [ -n "$_mp" ] && [ "$_mp" != "0" ] && sudo kill -USR1 "$_mp" 2>/dev/null || true
+  (
+    i=0
+    while [ "$i" -lt 18 ]; do tmux refresh-client -S 2>/dev/null; i=$((i+1)); sleep 0.3; done
+    tmux refresh-client -S 2>/dev/null
+  ) >/dev/null 2>&1 &
+}
+
+cur=$(read_mode)
+case "${1:-status}" in
+  normal|economy|headless|router) set_mode "$1" ;;
+  cycle)  # common modes only; headless/router are set explicitly by name
+    if [ "$cur" = economy ]; then set_mode normal; else set_mode economy; fi ;;
+  status)
+    ac=$(cat "$AC" 2>/dev/null)
+    case "$cur" in
+      economy) [ "$ac" = 0 ] && s="active (на батарее)" || s="armed (на зарядке, спит)" ;;
+      headless|router) s="(пока ведёт себя как normal — не реализован)" ;;
+      *) s="" ;;
+    esac
+    echo "mode: $cur ${s:+— $s}" ;;
+  *) echo "usage: uconsole-mode normal|economy|headless|router|cycle|status" >&2; exit 1 ;;
+esac

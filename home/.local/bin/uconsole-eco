@@ -1,41 +1,13 @@
 #!/usr/bin/env bash
-# Toggle the uConsole economy mode (persistent pref). Effects (CPU powersave +
-# idle screen dim) are applied by uconsole-powerd, and only when on battery.
+# Backwards-compat alias for the old economy toggle. economy on/off now maps onto
+# the mode selector (normal<->economy). Prefer `uconsole-mode` directly.
 set -u
-
-PREF_DIR=/home/roman/.config/uconsole
-PREF="$PREF_DIR/economy"
-EVENT=/run/eco-event
-AC=/sys/class/power_supply/axp22x-ac/online
-
-mkdir -p "$PREF_DIR"
-cur=off; [ -r "$PREF" ] && cur=$(tr -d '[:space:]' < "$PREF")
-
-apply() {  # $1 = ON|OFF — marquee event + drive refreshes + poke the daemon
-  printf '%s\t%s\n' "$(date +%s)" "$1" > "$EVENT" 2>/dev/null || true
-  # Nudge the daemon (target ONLY its main PID; systemctl kill would also hit the
-  # libinput child and restart the daemon). Needs sudo as the daemon runs as root.
-  _mp=$(systemctl show -p MainPID --value uconsole-powerd.service 2>/dev/null)
-  [ -n "$_mp" ] && [ "$_mp" != "0" ] && sudo kill -USR1 "$_mp" 2>/dev/null || true
-  (
-    i=0
-    while [ "$i" -lt 18 ]; do tmux refresh-client -S 2>/dev/null; i=$((i+1)); sleep 0.3; done
-    tmux refresh-client -S 2>/dev/null
-  ) >/dev/null 2>&1 &
-}
+MODE_BIN=/home/roman/.local/bin/uconsole-mode
 
 case "${1:-toggle}" in
-  on)  echo on  > "$PREF"; apply ON ;;
-  off) echo off > "$PREF"; apply OFF ;;
-  toggle)
-    if [ "$cur" = "on" ]; then echo off > "$PREF"; apply OFF
-    else                        echo on  > "$PREF"; apply ON; fi ;;
-  status)
-    pref=off; [ -r "$PREF" ] && pref=$(tr -d '[:space:]' < "$PREF")
-    ac=$(cat "$AC" 2>/dev/null)
-    if   [ "$pref" = on ] && [ "$ac" = 0 ]; then state="active (на батарее)"
-    elif [ "$pref" = on ];                  then state="armed (на зарядке, не действует)"
-    else                                          state="off"; fi
-    echo "economy: $pref — $state" ;;
-  *) echo "usage: uconsole-eco on|off|toggle|status" >&2; exit 1 ;;
+  on)     exec "$MODE_BIN" economy ;;
+  off)    exec "$MODE_BIN" normal ;;
+  toggle) exec "$MODE_BIN" cycle ;;
+  status) exec "$MODE_BIN" status ;;
+  *) echo "usage: uconsole-eco on|off|toggle|status  (alias for uconsole-mode)" >&2; exit 1 ;;
 esac

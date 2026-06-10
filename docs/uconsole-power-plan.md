@@ -151,3 +151,109 @@ GUARD_SSH=1              # не рубить wifi / не выключаться 
 - Бегущая строка `CHARGING`/`ON BATTERY` при смене кабеля (udev + `power-event` + `battery-status`).
 - Статус-скрипты в `~/.local/bin/`: `brightness-status`, `network-status`, `cm5-temp`,
   `battery-status`, `tmux-system-status`, `net-marquee-trigger`.
+
+---
+
+# Режимы питания: рефактор + HEADLESS / ROUTER (2026-06-10)
+
+Булев pref `economy on/off` обобщён в **селектор режима**. Назначение новых режимов:
+uConsole работает с зависимым устройством (**ESP32-S3**) по USB, экран не нужен.
+
+## Модель режимов
+- Канон: `~/.config/uconsole/mode` ∈ `normal | economy | headless | router`
+  (legacy `~/.config/uconsole/economy` on/off читается как fallback и зеркалится — для отката).
+- `normal` ≡ старый `off`; `economy` ≡ старый `on` (поведение economy/normal — **бит-в-бит прежнее**).
+- Команда **`uconsole-mode normal|economy|headless|router|cycle|status`**. `cycle` гоняет только
+  `normal↔economy`. `uconsole-eco` остался тонким алиасом (`on`→economy, `off`→normal, `toggle`→cycle).
+- **headless/router — только по явной команде** (не в `cycle`, т.к. нужны редко). В будущем —
+  контекстно от ESP32-S3 (слушатель serial-событий зовёт `uconsole-mode`).
+- Бар (`eco-status`): economy→`ECO`/`eco`, headless→`HDL`, router→`RTR`, normal→пусто;
+  маркиза `MODE <NAME>` на 5с при смене.
+- Применение эффекта — **в пределах одного тика (≤5с)**: USR1 не прерывает `read` в демоне
+  (маркиза мгновенная, само действие догоняет).
+
+## HEADLESS (готов, проверен живьём)
+
+| Рычаг | Поведение |
+|---|---|
+| Экран | гаснет в ноль (`brightnessctl set 0`) через `HEADLESS_IDLE_OFF` простоя — **AC-агностично** |
+| Авто-выключение | **отключено** (idle ≠ «не используется» — устройство работает) |
+| Critical-battery | страховка: ≤`BATT_CRITICAL` → save+poweroff сразу, без отсчёта (без присмотра) |
+| CPU | `ondemand` (он вычисляет — не троттлим в powersave) |
+| Wi-Fi | по флагу `HEADLESS_WIFI` (off → `rfkill block wlan`) |
+| USB ESP32 | keepalive: `HEADLESS_USB_KEEP="VID:PID"` → `power/control=on` (пусто = инертно) |
+| Выход | `normal`/`economy`: `leave_new_modes` (экран + wifi назад); любая клавиша будит |
+
+Реализация: headless/router перехватываются в начале `evaluate()` **до** гейта по питанию,
+в `new_mode_eval()`. Новые ключи `/etc/uconsole-power.conf`:
+```
+HEADLESS_IDLE_OFF=30     # сек простоя → экран в ноль, независимо от зарядки
+HEADLESS_WIFI=off        # off = rfkill block wlan, on = оставить
+HEADLESS_USB_KEEP=       # "VID:PID" hex — держать устройство от autosuspend (пусто = не трогать)
+```
+
+## ROUTER (готов с моком ESP32; verified 2026-06-10)
+Как headless (экран-офф AC-агностично, без авто-выключения), но **wifi не глушит**.
+Назначение: держать 4G и **раздавать интернет ESP32 по USB**.
+
+**Реализовано** в `/usr/local/bin/uconsole-router up|down|status|test`; демон зовёт `up` при входе в
+режим и `down` при выходе (`router_ensure_up/down`). Что делает `up`: резолвит uplink
+(`ROUTER_UPLINK=auto`→текущий дефолтный iface, напр. wlan0 / `modem`→`uconsole-4g enable`+`nmcli up
+cyta-4g` / явный iface), поднимает downstream-iface, `ip_forward=1` (исходное → `/run/uconsole-router.state`),
+nft-таблица `inet uconsole_router` с `masquerade`, dnsmasq (DHCP+DNS) на downstream. `down` всё
+сворачивает и восстанавливает `ip_forward`.
+
+**ESP32 замокирован** как veth-пара, peer в netns `rt-esp32` (клиент 10.55.0.2, шлюз 10.55.0.1/24) —
+NAT проверен сквозь мок (`uconsole-router test`: пинг 8.8.8.8 через NAT, 0% потерь; DNS через dnsmasq).
+Реальное устройство потом: `ROUTER_MOCK=0` + `ROUTER_DOWN_IFACE=usb0` (cdc_ncm). Инструмент — только
+nftables (iptables в системе нет).
+
+**4G-обвязка уже есть** (не блокер — модем просто выключен по умолчанию):
+- `uconsole-4g enable|disable` (`/usr/bin/uconsole-4g` → `uconsole-4g-cm4.sh`, GPIO `pinctrl 24/15`)
+  — питание модуля. Сервис `uconsole-4g-cm4.service` **disabled**, оттого модем при загрузке не
+  виден в `mmcli`. (Скрипт назван cm4; на CM5 перепроверить применимость пинов.)
+- Данные — через NM gsm-профиль: `nmcli connection up cyta-4g` (fallback `cyta-4g-internet`),
+  оператор CYTA `28001`.
+- TUI `uconsole-4g-tui` (он же `4g-tui`): статус/power/register/data/SMS/USSD/calls/PIN.
+
+ROUTER переиспользует это (`uconsole-4g enable` + `nmcli connection up cyta-4g`) для `ROUTER_UPLINK=modem`;
+роутерная часть (`ip_forward`+NAT+dnsmasq) — в `uconsole-router`. Для отладки дефолт `ROUTER_UPLINK=auto`
+(текущий wlan0), чтобы не жечь 4G-трафик.
+
+## ⚠️ Найдено при тестах ROUTER: дрейф трекбола ломает idle-детект
+`event9` (трекбол) периодически сыплет непрерывный `POINTER_MOTION` (дрейф). Демон висит на
+`read -t TICK` из `libinput debug-events`; в момент дрейфа `read` постоянно возвращает события →
+срабатывает ветка сброса ввода, а `evaluate()` по таймауту **не зовётся** → простой не накапливается и
+смена режима применяется только в тихие окна (или при рестарте демона — стартовый `evaluate` всегда
+отрабатывает). Касается **всех режимов** (economy-dim, headless screen-off, router up/down). **Не
+исправлено.** Варианты: исключить трекбол из источника idle в powerd; игнорировать под-пороговый
+`POINTER_MOTION`; либо развязать частоту `evaluate()` от чтения ввода (тик по монотонным часам, ввод —
+только сброс `last`).
+
+## Зависимое устройство — ESP32-S3 (архитектура USB)
+- **uConsole = USB host**, ESP32-S3 — периферия на внешнем USB-A.
+  Gadget-режим невозможен: единственный UDC-способный контроллер `dwc2` занят внутренним хабом
+  (клавиатура+wifi), а внешние порты `xhci` — только хост.
+- ESP32-S3 через TinyUSB — **композитное устройство** стандартных классов (драйверы у uConsole есть):
+  CDC-ACM (`/dev/ttyACMx` — события/управление), CDC-NCM/ECM (`usbN` — интернет для ROUTER),
+  UAC2 (USB-аудио), HID.
+- Потолок: USB ESP32-S3 — **full-speed 12 Мбит/с** на всё сразу (аудио+сеть+serial делят полосу).
+- **Аудио — push-to-talk с кнопки ESP32** (голос после индикатора готовности; лаг допустим)
+  → звуковую карту/поток держать **холодными** до нажатия (экономнее).
+
+## Файлы (новые/изменённые этим этапом)
+| Файл | Роль |
+|---|---|
+| `~/.config/uconsole/mode` | канонический pref режима |
+| `~/.local/bin/uconsole-mode` | селектор режима (+маркиза +сигнал демону +refresh) |
+| `~/.local/bin/uconsole-eco` | теперь тонкий алиас на `uconsole-mode` |
+| `~/.local/bin/eco-status` | mode-aware ячейка (ECO/HDL/RTR) |
+| `/usr/local/bin/uconsole-powerd` | +`new_mode_eval`, `screen_off/on`, wifi/usb-keepalive, HEADLESS-ключи |
+| `~/.config/uconsole/refactor-backup-*` | бэкап скриптов до рефактора (откат) |
+
+## Осталось
+- **ROUTER:** оживить модем → `ip_forward`+NAT+dnsmasq на `usbN`.
+- **ESP32-S3:** канал событий (CDC), PTT-аудио (UAC2), интернет (CDC-NCM); вписать `VID:PID`
+  в `HEADLESS_USB_KEEP`.
+- **Контекстное** переключение режимов от ESP32 (слушатель serial → `uconsole-mode`).
+- Опц.: **мгновенное** применение режима (правка цикла демона; сейчас ≤5с).
