@@ -1,7 +1,9 @@
 #!/bin/bash
 # uConsole power-mode engine. Mode pref (normal|economy|headless|router) selects behaviour.
 #
-# economy (== old "on") + on battery: CPU powersave + dim screen after IDLE_DIM; auto-shutdown
+# economy (== old "on"): CPU powersave on battery; on AC keep powersave until battery is
+#   sufficiently charged and the CPU is cool enough. On battery also dim screen after IDLE_DIM;
+#   auto-shutdown
 #   on battery when no input AND no network traffic for the threshold (net resets the SHUTDOWN
 #   timer but NOT the dim timer); low/critical battery shuts down on input-idle alone. Warning
 #   window (escalating sound) cancellable by any input. On AC: never shut down.
@@ -24,6 +26,7 @@ RUNUID=$(id -u roman 2>/dev/null || echo 1000)
 
 # defaults (overridden by conf)
 IDLE_DIM=90; DIM_LEVEL=1; CPU_GOVERNOR=powersave; NORMAL_GOVERNOR=ondemand; TICK=5
+ECO_AC_CPU_RELEASE_BATT=70; ECO_AC_CPU_RELEASE_TEMP=42
 SHUTDOWN_IDLE_ECO=600; SHUTDOWN_IDLE_NORMAL=900; SHUTDOWN_BATT_OVERRIDE=50; BATT_CRITICAL=5
 NET_RATE=20480; NET_QUIET=120; SHUTDOWN_WARN=60; WIFI_PS=on; DRY_RUN=1
 WARN_SOUND=/usr/local/share/uconsole/shutdown-warn.wav
@@ -49,6 +52,34 @@ net_dev()    { ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($
 
 set_gov()        { [ "$(cat "$GOV" 2>/dev/null)" = "$1" ] || echo "$1" > "$GOV" 2>/dev/null; }
 assert_wifi_ps() { [ "$WIFI_PS" = "on" ] && iw dev wlan0 set power_save on 2>/dev/null; return 0; }
+cpu_temp_mc() {
+  local temp raw f
+  if command -v vcgencmd >/dev/null 2>&1; then
+    temp=$(vcgencmd measure_temp 2>/dev/null | sed -n "s/^temp=\([0-9.]*\).*$/\1/p")
+    [ -n "$temp" ] && awk -v t="$temp" "BEGIN{printf \"%d\n\", t * 1000}" && return
+  fi
+
+  for f in /sys/class/thermal/thermal_zone*/temp /sys/class/hwmon/hwmon*/temp*_input; do
+    [ -r "$f" ] || continue
+    raw=$(cat "$f" 2>/dev/null)
+    case "$raw" in
+      ""|*[!0-9]*) continue ;;
+    esac
+    if [ "$raw" -gt 1000 ]; then echo "$raw"; else echo $((raw * 1000)); fi
+    return
+  done
+}
+eco_cpu_ac_wants_powersave() {
+  local b temp threshold
+  b=$(batt); [ -n "$b" ] || return 0
+  [ "$b" -ge "$ECO_AC_CPU_RELEASE_BATT" ] || return 0
+
+  [ -n "$ECO_AC_CPU_RELEASE_TEMP" ] || return 1
+  temp=$(cpu_temp_mc); [ -n "$temp" ] || return 0
+  threshold=$(awk -v t="$ECO_AC_CPU_RELEASE_TEMP" "BEGIN{printf \"%d\n\", t * 1000}")
+  [ "$temp" -gt "$threshold" ] && return 0
+  return 1
+}
 play_warn() {
   [ -n "$WARN_SOUND" ] && [ -r "$WARN_SOUND" ] || return 0
   runuser -u roman -- env XDG_RUNTIME_DIR="/run/user/$RUNUID" pw-play "$WARN_SOUND" >/dev/null 2>&1 &
@@ -186,14 +217,25 @@ evaluate() {
   fi
   leave_new_modes   # undo new-mode side effects when back in normal/economy
 
-  if ! on_battery; then was_on_ac=1; restore_all; return; fi
+  local eco=off; [ "$mode" = economy ] && eco=on
+  prev_mode_logged="$mode"
+
+  if ! on_battery; then
+    was_on_ac=1
+    undim
+    cancel_warn
+    if [ "$eco" = "on" ] && eco_cpu_ac_wants_powersave; then
+      set_gov "$CPU_GOVERNOR"
+    else
+      set_gov "$NORMAL_GOVERNOR"
+    fi
+    return
+  fi
 
   if [ "$was_on_ac" = "1" ]; then
     last=$(now); last_net_active=$(now); was_on_ac=0
   fi
 
-  local eco=off; [ "$mode" = economy ] && eco=on
-  prev_mode_logged="$mode"
   local t b input_idle shut_idle la want=0
   t=$(now); b=$(batt); [ -z "$b" ] && b=100
   input_idle=$(( t - last ))

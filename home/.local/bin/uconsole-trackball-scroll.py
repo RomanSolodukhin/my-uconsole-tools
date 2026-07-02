@@ -5,7 +5,8 @@ The trackball only emits REL_X/REL_Y (no wheel events), and on a bare
 framebuffer console there is no pointer, so the ball is otherwise unused.
 We accumulate REL_Y and drive tmux copy-mode: roll up -> scroll back,
 roll down -> scroll forward (auto-exits copy-mode at the bottom).
-Variant A: active tmux pane only.
+Targets the pane attached to the real console client, so it also works when
+Codex itself is running under sudo and root has a different tmux socket.
 """
 import os
 import subprocess
@@ -18,15 +19,35 @@ UNITS_PER_LINE = 8        # smaller = more sensitive (REL_Y units per scrolled l
 MAX_LINES = 12            # clamp one burst so a fast flick can't jump miles
 INVERT = False            # True -> roll up scrolls forward instead of back
 TMUX = "/usr/bin/tmux"
+TMUX_SOCKET = os.environ.get("UCONSOLE_TMUX_SOCKET", "/tmp/tmux-1000/default")
+TMUX_CLIENT = os.environ.get("UCONSOLE_TMUX_CLIENT", "/dev/tty1")
 ENV = dict(os.environ)
 ENV.setdefault("TMUX_TMPDIR", "/tmp")
 
 
-def pane_state():
-    """Return (mouse_aware, width, height) for the active pane."""
+def tmux_args(*args):
+    return [TMUX, "-S", TMUX_SOCKET, *args]
+
+
+def tmux_run(*args, **kwargs):
+    return subprocess.run(tmux_args(*args), env=ENV, **kwargs)
+
+
+def active_pane():
+    """Return the pane id attached to the console client."""
+    r = tmux_run(
+        "display-message", "-c", TMUX_CLIENT, "-p", "#{pane_id}",
+        capture_output=True, text=True, check=False,
+    )
+    pane = r.stdout.strip()
+    return pane if pane.startswith("%") else None
+
+
+def pane_state(pane):
+    """Return (mouse_aware, width, height) for pane."""
     r = subprocess.run(
-        [TMUX, "display-message", "-p",
-         "#{mouse_any_flag} #{pane_width} #{pane_height}"],
+        tmux_args("display-message", "-t", pane, "-p",
+                  "#{mouse_any_flag} #{pane_width} #{pane_height}"),
         env=ENV, capture_output=True, text=True, check=False,
     )
     parts = r.stdout.split()
@@ -48,34 +69,37 @@ def find_device():
 
 
 def scroll(lines, up):
+    pane = active_pane()
+    if pane is None:
+        return
     count = min(abs(lines), MAX_LINES)
     n = str(count)
-    mouse_aware, w, h = pane_state()
+    mouse_aware, w, h = pane_state(pane)
     if mouse_aware:
         # App has SGR mouse tracking on: feed it real wheel events so it
         # scrolls itself (claude, ssh TUIs, less -with-mouse, etc.).
         # SGR wheel: ESC [ < 64 ; col ; row M (64=up, 65=down).
         btn = 64 if up else 65
         seq = "\x1b[<%d;%d;%dM" % (btn, max(w // 2, 1), max(h // 2, 1))
-        subprocess.run(
-            [TMUX, "send-keys", "-l", "--", seq * count],
-            env=ENV, check=False,
+        tmux_run(
+            "send-keys", "-t", pane, "-l", "--", seq * count,
+            check=False,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
     elif up:
         # Plain shell: enter copy-mode (-e auto-exits at the bottom) and scroll.
-        subprocess.run(
-            [TMUX, "copy-mode", "-e", ";",
-             "send-keys", "-X", "-N", n, "scroll-up"],
-            env=ENV, check=False,
+        tmux_run(
+            "copy-mode", "-e", "-t", pane, ";",
+            "send-keys", "-t", pane, "-X", "-N", n, "scroll-up",
+            check=False,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
     else:
         # Plain shell, scrolling forward: only meaningful if already in copy-mode.
-        subprocess.run(
-            [TMUX, "if-shell", "-F", "#{pane_in_mode}",
-             "send-keys -X -N %s scroll-down" % n],
-            env=ENV, check=False,
+        tmux_run(
+            "if-shell", "-t", pane, "-F", "#{pane_in_mode}",
+            "send-keys -t %s -X -N %s scroll-down" % (pane, n),
+            check=False,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
 
