@@ -88,8 +88,25 @@ def descendant_commands(root_pid):
     return {commands[pid] for pid in seen if pid in commands}
 
 
-def send_page_keys(pane, up, count):
-    key = "PPage" if up else "NPage"
+def pane_text(pane):
+    r = tmux_run(
+        "capture-pane", "-t", pane, "-p",
+        capture_output=True, text=True, check=False,
+    )
+    return r.stdout
+
+
+def send_codex_scroll(pane, up, count):
+    text = pane_text(pane).lower()
+    if "ctrl + t to view transcript" in text:
+        tmux_run(
+            "send-keys", "-t", pane, "C-t",
+            check=False,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        time.sleep(0.05)
+
+    key = "Up" if up else "Down"
     tmux_run(
         "send-keys", "-t", pane, "-N", str(count), key,
         check=False,
@@ -117,7 +134,7 @@ def scroll(lines, up):
     n = str(count)
     mouse_aware, w, h, pid = pane_state(pane)
     if "codex" in descendant_commands(pid):
-        send_page_keys(pane, up, count)
+        send_codex_scroll(pane, up, count)
         return
     if mouse_aware:
         # App has SGR mouse tracking on: feed it real wheel events so it
