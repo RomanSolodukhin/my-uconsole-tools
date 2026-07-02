@@ -44,16 +44,57 @@ def active_pane():
 
 
 def pane_state(pane):
-    """Return (mouse_aware, width, height) for pane."""
+    """Return (mouse_aware, width, height, pid) for pane."""
     r = subprocess.run(
         tmux_args("display-message", "-t", pane, "-p",
-                  "#{mouse_any_flag} #{pane_width} #{pane_height}"),
+                  "#{mouse_any_flag} #{pane_width} #{pane_height} #{pane_pid}"),
         env=ENV, capture_output=True, text=True, check=False,
     )
     parts = r.stdout.split()
-    if len(parts) != 3:
-        return (False, 80, 24)
-    return (parts[0] == "1", int(parts[1]), int(parts[2]))
+    if len(parts) != 4:
+        return (False, 80, 24, None)
+    return (parts[0] == "1", int(parts[1]), int(parts[2]), int(parts[3]))
+
+
+def descendant_commands(root_pid):
+    """Return command names under root_pid, including grandchildren."""
+    if root_pid is None:
+        return set()
+    children = {}
+    commands = {}
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        try:
+            with open(f"/proc/{pid}/stat") as fh:
+                stat = fh.read().split()
+            ppid = int(stat[3])
+            with open(f"/proc/{pid}/comm") as fh:
+                commands[pid] = fh.read().strip()
+        except (OSError, ValueError, IndexError):
+            continue
+        children.setdefault(ppid, []).append(pid)
+
+    seen = set()
+    stack = [root_pid]
+    while stack:
+        pid = stack.pop()
+        for child in children.get(pid, []):
+            if child in seen:
+                continue
+            seen.add(child)
+            stack.append(child)
+    return {commands[pid] for pid in seen if pid in commands}
+
+
+def send_page_keys(pane, up, count):
+    key = "PPage" if up else "NPage"
+    tmux_run(
+        "send-keys", "-t", pane, "-N", str(count), key,
+        check=False,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
 
 
 def find_device():
@@ -74,7 +115,10 @@ def scroll(lines, up):
         return
     count = min(abs(lines), MAX_LINES)
     n = str(count)
-    mouse_aware, w, h = pane_state(pane)
+    mouse_aware, w, h, pid = pane_state(pane)
+    if "codex" in descendant_commands(pid):
+        send_page_keys(pane, up, count)
+        return
     if mouse_aware:
         # App has SGR mouse tracking on: feed it real wheel events so it
         # scrolls itself (claude, ssh TUIs, less -with-mouse, etc.).
