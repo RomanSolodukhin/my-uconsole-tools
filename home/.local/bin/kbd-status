@@ -1,6 +1,8 @@
 #!/bin/sh
 # tmux status segment: current console keyboard layout, tracked by kbdlayoutd.
-f="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/kbdlayout"
+# Shared location first (readable by every local user), per-user XDG as fallback.
+f=/run/uconsole/kbdlayout
+[ -r "$f" ] || f="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/kbdlayout"
 [ -r "$f" ] || exit 0
 l=$(cat "$f" 2>/dev/null) || exit 0
 [ -n "$l" ] || exit 0

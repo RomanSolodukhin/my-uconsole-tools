@@ -22,9 +22,11 @@ docs/uconsole-power-plan.md                               -> design doc
 
 **Console / status bar**
 - `etc/default/console-setup` — font `TerminusBold 28x14` (readable, Cyrillic).
-- `home/.tmux.conf` — `status-right` assembled from the scripts below, cells joined by `▒`.
+- `home/.tmux.conf` — `status-right` assembled from the scripts below, cells joined by `▒`;
+  also provides tmux bindings for volume control and a work-user window.
 - `home/.local/bin/`: `tmux-system-status` (joins cells), `brightness-status` (`●N`),
-  `network-status`, `cm5-temp` (`NN.N°`), `battery-status` (`↑/↓ NN%`), `eco-status` (`ECO`).
+  `network-status`, `cm5-temp` (`NN.N°`), `battery-status` (`↑/↓ NN%`), `eco-status` (`ECO`),
+  `volume-control`/`volume-status` and `uconsole-splash`.
 
 **Brightness keys** (Fn brightness → backlight 0–9)
 - `usr/local/bin/ucon-brightness` — step with floor=1, instant status refresh.

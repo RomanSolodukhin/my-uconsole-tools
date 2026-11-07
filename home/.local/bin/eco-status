@@ -13,10 +13,18 @@ PREF="$PREF_DIR/economy"     # legacy fallback
 AC=/sys/class/power_supply/axp22x-ac/online
 WINDOW=5; FRAME=0.3; MWIDTH=12; GAP="   "; SEP="▒"
 
+SHARED=/run/uconsole/mode        # mirror readable by other local users (work user)
+
 read_mode() {
-  if [ -r "$MODE" ]; then tr -d '[:space:]' < "$MODE"
-  elif [ -r "$PREF" ] && [ "$(tr -d '[:space:]' < "$PREF")" = on ]; then echo economy
-  else echo normal; fi
+  local m
+  if [ -r "$MODE" ]; then
+    m=$(tr -d '[:space:]' < "$MODE")
+    # keep the shared mirror in sync (self-heals after reboot: /run is wiped)
+    [ -w "$SHARED" ] || [ ! -e "$SHARED" ] && [ "$(cat "$SHARED" 2>/dev/null)" != "$m" ] && echo "$m" > "$SHARED" 2>/dev/null
+  elif [ -r "$PREF" ] && [ "$(tr -d '[:space:]' < "$PREF")" = on ]; then m=economy
+  elif [ -r "$SHARED" ]; then m=$(tr -d '[:space:]' < "$SHARED"); [ -n "$m" ] || m=normal
+  else m=normal; fi
+  echo "$m"
 }
 
 # Mode-change marquee window

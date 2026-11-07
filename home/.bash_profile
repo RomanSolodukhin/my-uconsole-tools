@@ -22,17 +22,9 @@ if [ -z "$TMUX" ] && [ "$(tty)" = "/dev/tty1" ]; then
     exec tmux new -A -s uconsole
 fi
 
-# uConsole startup splash — print once per tmux session, in the first shell.
-# Each tmux pane is a login shell that re-reads this file, so a per-session
-# flag keeps the banner from reappearing in every new window/pane.
-if [ -n "$TMUX" ] && [ -x "$HOME/.local/bin/uconsole-splash" ]; then
-    _sp_sid=$(tmux display-message -p '#{session_id}' 2>/dev/null)
-    _sp_flag="${TMPDIR:-/tmp}/uconsole-splash.${_sp_sid#\$}"
-    if [ -n "$_sp_sid" ] && [ ! -e "$_sp_flag" ]; then
-        : > "$_sp_flag"
-        "$HOME/.local/bin/uconsole-splash"
-    fi
-    unset _sp_sid _sp_flag
+# Show the uConsole banner in each new interactive tmux window/pane.
+if [[ $- == *i* ]] && [ -n "$TMUX" ] && [ -t 1 ] && [ -x "$HOME/.local/bin/uconsole-splash" ]; then
+    "$HOME/.local/bin/uconsole-splash"
 fi
 
 . "$HOME/.atuin/bin/env"

@@ -24,6 +24,7 @@ read_mode() {
 
 set_mode() {  # $1 = mode name — write pref, fire marquee, poke daemon, drive refreshes
   echo "$1" > "$MODE"
+  echo "$1" > /run/uconsole/mode 2>/dev/null || true   # shared mirror for other local users
   if [ "$1" = economy ]; then echo on > "$ECO"; else echo off > "$ECO"; fi
   printf '%s\t%s\n' "$(date +%s)" "$1" > "$EVENT" 2>/dev/null || true
   # Nudge the daemon (target ONLY its main PID; systemctl kill would also hit the

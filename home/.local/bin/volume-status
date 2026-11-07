@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Short-lived tmux status cell for audio changes. It stays quiet normally, then
+# shows the current sink volume for a few seconds after volume-control fires.
+set -u
+
+uid=${UID:-$(id -u)}
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$uid}"
+
+EVENT="$XDG_RUNTIME_DIR/volume-status-event"
+WINDOW=5
+SEP="▒"
+
+[ -r "$EVENT" ] || exit 0
+
+IFS=$'\t' read -r ev_epoch _ < "$EVENT"
+[ -n "${ev_epoch:-}" ] || exit 0
+
+now=$(date +%s.%N)
+inwin=$(awk -v now="$now" -v ev="$ev_epoch" -v w="$WINDOW" \
+  'BEGIN{ e = now - ev; print (e >= 0 && e < w) ? 1 : 0 }')
+[ "$inwin" = "1" ] || exit 0
+
+out=$(wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null) || {
+  printf 'VOL ?%s\n' "$SEP"
+  exit 0
+}
+
+vol=$(awk '/Volume:/ { printf "%d", ($2 * 100) + 0.5 }' <<<"$out")
+case "$out" in
+  *MUTED*) printf 'MUTE%s\n' "$SEP" ;;
+  *)       printf 'VOL %s%%%s\n' "${vol:-?}" "$SEP" ;;
+esac

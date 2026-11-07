@@ -1,0 +1,612 @@
+#!/usr/bin/env python3
+# uconsole-splash — startup banner for tmux on the uConsole.
+# Draws an ANSI "sky" scene (moon/sun/clouds/rain/...) chosen from the
+# current weather + time of day, next to a panel of system status.
+#
+#   uconsole-splash            print the banner
+#   uconsole-splash --refresh  refresh the cached weather (run in background)
+#
+# Tunables via env:
+#   SPLASH_HOST   override the host label (default: hostname)
+#   SPLASH_LOC    weather location for wttr.in (default: auto by IP)
+
+import os
+import sys
+import time
+import shutil
+import socket
+import subprocess
+
+HOME = os.path.expanduser("~")
+CACHE = "/tmp/uconsole-splash-weather.txt"
+CACHE_TTL = 1200  # 20 min
+WTTR_FMT = "%c|%C|%t|%f|%w|%h|%m"
+
+# ---------------------------------------------------------------- ANSI helpers
+ESC = "\033["
+RESET = ESC + "0m"
+
+
+def fg(c):
+    return f"{ESC}38;5;{c}m"
+
+
+def bg(c):
+    return f"{ESC}48;5;{c}m"
+
+
+BOLD = ESC + "1m"
+DIM = ESC + "2m"
+
+
+# ------------------------------------------------------------ block-letter font
+# 5-row block glyphs ('#' = filled). Rendered big above the frame.
+FONT = {
+    "A": [" ## ", "#  #", "####", "#  #", "#  #"],
+    "B": ["### ", "#  #", "### ", "#  #", "### "],
+    "C": [" ###", "#   ", "#   ", "#   ", " ###"],
+    "D": ["### ", "#  #", "#  #", "#  #", "### "],
+    "E": ["####", "#   ", "### ", "#   ", "####"],
+    "F": ["####", "#   ", "### ", "#   ", "#   "],
+    "G": [" ###", "#   ", "# ##", "#  #", " ###"],
+    "H": ["#  #", "#  #", "####", "#  #", "#  #"],
+    "I": ["###", " # ", " # ", " # ", "###"],
+    "J": ["  ##", "   #", "   #", "#  #", " ## "],
+    "K": ["#  #", "# # ", "##  ", "# # ", "#  #"],
+    "L": ["#   ", "#   ", "#   ", "#   ", "####"],
+    "M": ["#   #", "## ##", "# # #", "#   #", "#   #"],
+    "N": ["#  #", "## #", "# ##", "#  #", "#  #"],
+    "O": [" ## ", "#  #", "#  #", "#  #", " ## "],
+    "P": ["### ", "#  #", "### ", "#   ", "#   "],
+    "Q": [" ## ", "#  #", "#  #", "# # ", " # #"],
+    "R": ["### ", "#  #", "### ", "# # ", "#  #"],
+    "S": [" ###", "#   ", " ## ", "   #", "### "],
+    "T": ["###", " # ", " # ", " # ", " # "],
+    "U": ["#  #", "#  #", "#  #", "#  #", " ## "],
+    "V": ["#  #", "#  #", "#  #", " ## ", " ## "],
+    "W": ["#   #", "#   #", "# # #", "## ##", "#   #"],
+    "X": ["#  #", " ## ", " ## ", " ## ", "#  #"],
+    "Y": ["#  #", " ## ", " #  ", " #  ", " #  "],
+    "Z": ["####", "  # ", " #  ", "#   ", "####"],
+    "0": [" ## ", "# ##", "# # ", "## #", " ## "],
+    "1": [" # ", "## ", " # ", " # ", "###"],
+    "2": [" ## ", "#  #", "  # ", " #  ", "####"],
+    "3": ["### ", "   #", " ## ", "   #", "### "],
+    "4": ["#  #", "#  #", "####", "   #", "   #"],
+    "5": ["####", "#   ", "### ", "   #", "### "],
+    "6": [" ###", "#   ", "### ", "#  #", " ## "],
+    "7": ["####", "   #", "  # ", " #  ", " #  "],
+    "8": [" ## ", "#  #", " ## ", "#  #", " ## "],
+    "9": [" ## ", "#  #", " ###", "   #", "### "],
+    "-": ["    ", "    ", "####", "    ", "    "],
+    ".": ["  ", "  ", "  ", "  ", "##"],
+    " ": ["  ", "  ", "  ", "  ", "  "],
+}
+# Gradient used across the banner (left -> right).
+BANNER_GRAD = [39, 38, 44, 43, 49, 48, 42]
+
+
+def render_banner(text, max_cols):
+    """Return 5 colored lines of block letters, or None if it won't fit."""
+    glyphs = []
+    for ch in text.upper():
+        glyphs.append(FONT.get(ch, FONT[" "]))
+    if not glyphs:
+        return None
+    gap = 1
+    widths = [len(g[0]) for g in glyphs]
+    total = sum(widths) + gap * (len(glyphs) - 1)
+    if total > max_cols:
+        return None
+    rows = []
+    for r in range(5):
+        line = []
+        x = 0
+        for gi, g in enumerate(glyphs):
+            for ch in g[r]:
+                if ch == " ":
+                    line.append(" ")
+                else:
+                    col = BANNER_GRAD[(x * len(BANNER_GRAD)) // max(total, 1)]
+                    line.append(fg(col) + "█")
+                x += 1
+            if gi != len(glyphs) - 1:
+                line.append(" " * gap)
+                x += gap
+        rows.append("".join(line) + RESET)
+    return rows
+
+
+# ----------------------------------------------------------------- sky scenes
+# Each scene: (sky_bg, palette, art) where art is 7 rows x 14 cols of legend
+# chars. palette maps a legend char -> (fg_color, glyph). ' ' is sky.
+SCENES = {
+    "night-clear": (
+        17,
+        {
+            ".": (245, "·"), "*": (252, "✦"), "+": (231, "✧"),
+            "m": (230, "█"), "M": (223, "█"),
+        },
+        [
+            "  .       Mmm ",
+            "     +   MmmmM",
+            "   .     mmmmm",
+            "  *    .  Mmm ",
+            "      +    .  ",
+            " .       *    ",
+            "    *   +    .",
+        ],
+    ),
+    "day-clear": (
+        117,
+        {
+            "r": (220, "\\"), "R": (220, "/"), "|": (220, "|"), "-": (220, "-"),
+            "O": (226, "█"), "o": (220, "█"),
+        },
+        [
+            "        |     ",
+            "   \\   ooo   /",
+            "    - oOOOOo -",
+            "      oOOOOo  ",
+            "   /   ooo   \\",
+            "        |     ",
+            "             ",
+        ],
+    ),
+    "partly-day": (
+        117,
+        {
+            "O": (226, "█"), "o": (220, "█"),
+            "c": (255, "█"), "C": (250, "█"),
+        },
+        [
+            "    ooo       ",
+            "   oOOOo      ",
+            "    ooo  ccc  ",
+            "      cCCCCCc ",
+            "    cCCCCCCCCc",
+            "     CCCCCCCC ",
+            "             ",
+        ],
+    ),
+    "partly-night": (
+        17,
+        {
+            "*": (252, "✦"), "+": (231, "✧"), "m": (230, "█"),
+            "c": (252, "█"), "C": (246, "█"),
+        },
+        [
+            "   mm     +   ",
+            "  mmmm    *   ",
+            "   mm   ccc   ",
+            "  *   cCCCCCc ",
+            "    cCCCCCCCCc",
+            "  +  CCCCCCCC ",
+            "    *        ",
+        ],
+    ),
+    "cloud": (
+        110,
+        {"c": (255, "█"), "C": (250, "█"), "d": (244, "█")},
+        [
+            "    ccc       ",
+            "  ccCCCcc     ",
+            " cCCCCCCCc ccc",
+            "cCCCCCCCCcCCCc",
+            " dCCCCCCdCCCCd",
+            "  ddddddddddd ",
+            "             ",
+        ],
+    ),
+    "rain": (
+        103,
+        {"c": (252, "█"), "C": (245, "█"), "d": (240, "█"), "/": (75, "╱")},
+        [
+            "   ccccc      ",
+            " cCCCCCCCc    ",
+            "cCCCCCCCCCcccc",
+            "dCCCCCCCCdCCCd",
+            " ddddddddddd  ",
+            " / / / / / /  ",
+            "/ / / / / /  ",
+        ],
+    ),
+    "snow": (
+        110,
+        {"c": (255, "█"), "C": (250, "█"), "d": (244, "█"), "*": (231, "❄"), ".": (255, "·")},
+        [
+            "   ccccc      ",
+            " cCCCCCCCc    ",
+            "cCCCCCCCCCcccc",
+            "dCCCCCCCCdCCCd",
+            " ddddddddddd  ",
+            "  *   .   *   ",
+            "    .   *   . ",
+        ],
+    ),
+    "thunder": (
+        60,
+        {"c": (250, "█"), "C": (242, "█"), "d": (236, "█"), "z": (226, "ϟ"), "/": (69, "╱")},
+        [
+            "   ccccc      ",
+            " cCCCCCCCc    ",
+            "cCCCCCCCCCcccc",
+            "dCCCCCCCCdCCCd",
+            " ddddddddddd  ",
+            "    zz  / /   ",
+            "   zz  / /   ",
+        ],
+    ),
+    "fog": (
+        145,
+        {"~": (250, "═"), "-": (252, "─")},
+        [
+            "             ",
+            "  ~~~~~~~~~~  ",
+            " ------------ ",
+            "  ~~~~~~~~~~  ",
+            " ------------ ",
+            "  ~~~~~~~~~~  ",
+            "             ",
+        ],
+    ),
+}
+
+ART_W = 14
+ART_H = 7
+
+
+def render_scene(name):
+    sky_bg, palette, art = SCENES.get(name, SCENES["cloud"])
+    rows = []
+    for line in art:
+        line = (line + " " * ART_W)[:ART_W]
+        out = [bg(sky_bg)]
+        for ch in line:
+            if ch == " " or ch not in palette:
+                out.append(" ")
+            else:
+                f, g = palette[ch]
+                out.append(fg(f) + g)
+        out.append(RESET)
+        rows.append("".join(out))
+    return rows
+
+
+def classify(cond_text, is_night):
+    t = cond_text.lower()
+    if "thunder" in t:
+        return "thunder"
+    if any(k in t for k in ("snow", "sleet", "blizzard", "ice")):
+        return "snow"
+    if any(k in t for k in ("rain", "drizzle", "shower")):
+        return "rain"
+    if any(k in t for k in ("fog", "mist", "haze", "smoke")):
+        return "fog"
+    if "partly" in t or ("cloud" in t and "overcast" not in t):
+        return "partly-night" if is_night else "partly-day"
+    if any(k in t for k in ("cloud", "overcast")):
+        return "cloud"
+    if any(k in t for k in ("clear", "sunny", "sun")):
+        return "night-clear" if is_night else "day-clear"
+    return "partly-night" if is_night else "partly-day"
+
+
+# ------------------------------------------------------------------- weather
+def fetch_weather():
+    loc = os.environ.get("SPLASH_LOC", "")
+    url = f"https://wttr.in/{loc}?format={WTTR_FMT}"
+    try:
+        out = subprocess.run(
+            ["curl", "-fsS", "--max-time", "6", url],
+            capture_output=True, text=True, timeout=8,
+        ).stdout.strip()
+    except Exception:
+        return None
+    if out and "|" in out and "Unknown" not in out:
+        return out
+    return None
+
+
+def read_weather():
+    """Return (parts_or_None, stale_bool)."""
+    data, stale = None, True
+    if os.path.exists(CACHE):
+        age = time.time() - os.path.getmtime(CACHE)
+        try:
+            with open(CACHE) as f:
+                data = f.read().strip()
+        except OSError:
+            data = None
+        stale = age > CACHE_TTL
+    if not data:
+        # No cache yet: do one blocking fetch so the first launch shows weather.
+        data = fetch_weather()
+        if data:
+            try:
+                with open(CACHE, "w") as f:
+                    f.write(data)
+            except OSError:
+                pass
+            stale = False
+    if stale:
+        # Kick a background refresh for next time; don't block startup.
+        try:
+            subprocess.Popen(
+                ["setsid", sys.executable, os.path.abspath(__file__), "--refresh"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+    if not data:
+        return None
+    return data.split("|")
+
+
+# -------------------------------------------------------------- system stats
+def read_meminfo():
+    info = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                info[k] = int(v.split()[0])  # kB
+    except OSError:
+        return None
+    total = info.get("MemTotal", 0)
+    avail = info.get("MemAvailable", info.get("MemFree", 0))
+    used = total - avail
+    return used, total  # kB
+
+
+def human_mem(kb):
+    mb = kb / 1024
+    if mb >= 1024:
+        return f"{mb/1024:.1f}G"
+    return f"{mb:.0f}M"
+
+
+def read_uptime():
+    try:
+        with open("/proc/uptime") as f:
+            secs = float(f.read().split()[0])
+    except (OSError, ValueError):
+        return "?"
+    d, rem = divmod(int(secs), 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m"
+
+
+def read_battery():
+    base = "/sys/class/power_supply"
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return None
+    for n in names:
+        p = os.path.join(base, n)
+        try:
+            with open(os.path.join(p, "type")) as f:
+                if f.read().strip() != "Battery":
+                    continue
+            with open(os.path.join(p, "capacity")) as f:
+                cap = f.read().strip()
+            status = "?"
+            try:
+                with open(os.path.join(p, "status")) as f:
+                    status = f.read().strip()
+            except OSError:
+                pass
+        except OSError:
+            continue
+        mark = {"Charging": "+", "Full": "=", "Discharging": ""}.get(status, "")
+        return f"{cap}%{mark}", status
+    return None
+
+
+def read_cpu_temp():
+    try:
+        out = subprocess.run(
+            ["vcgencmd", "measure_temp"], capture_output=True, text=True, timeout=2
+        ).stdout
+        if "temp=" in out:
+            return out.split("temp=")[1].split("'")[0] + "C"
+    except Exception:
+        pass
+    for z in ("/sys/class/thermal/thermal_zone0/temp",):
+        try:
+            with open(z) as f:
+                v = int(f.read().strip())
+            return f"{v/1000:.0f}C" if v > 1000 else f"{v}C"
+        except (OSError, ValueError):
+            continue
+    return "?"
+
+
+def read_load():
+    try:
+        return f"{os.getloadavg()[0]:.2f}"
+    except OSError:
+        return "?"
+
+
+def run(cmd):
+    try:
+        return subprocess.run(
+            cmd, capture_output=True, text=True, timeout=4
+        ).stdout.strip()
+    except Exception:
+        return ""
+
+
+def read_network():
+    net = run([f"{HOME}/.local/bin/network-status"]) or "NET ?"
+    ip = ""
+    out = run(["ip", "-o", "-4", "route", "get", "1.1.1.1"])
+    if " src " in out:
+        ip = out.split(" src ")[1].split()[0]
+    return net, ip
+
+
+def read_4g():
+    """Summarize the 4G modem: state, tech, signal, operator — or 'off'."""
+    if not shutil.which("mmcli"):
+        return None
+    if "Modem/" not in run(["mmcli", "-L"]):
+        return "off"
+    kv = {}
+    for line in run(["mmcli", "-m", "any", "-K"]).splitlines():
+        k, sep, v = line.partition(":")
+        if sep:
+            kv[k.strip()] = v.strip()
+    state = kv.get("modem.generic.state", "")
+    tech = kv.get("modem.generic.access-technologies.value", "")
+    sig = kv.get("modem.generic.signal-quality.value", "")
+    op = kv.get("modem.3gpp.operator-name", "")
+    parts = []
+    for p in (state, tech.upper(), f"{sig}%" if sig and sig.isdigit() else "", op):
+        if p and p != "--":
+            parts.append(p)
+    return "  ".join(parts) if parts else "present"
+
+
+def human_bytes(n):
+    g = n / (1024 ** 3)
+    if g >= 1:
+        return f"{g:.1f}G"
+    return f"{n / (1024 ** 2):.0f}M"
+
+
+def read_disk(path="/"):
+    try:
+        st = os.statvfs(path)
+    except OSError:
+        return None
+    total = st.f_blocks * st.f_frsize
+    used = (st.f_blocks - st.f_bfree) * st.f_frsize
+    avail = st.f_bavail * st.f_frsize
+    pct = round(used * 100 / (used + avail)) if (used + avail) else 0
+    return human_bytes(used), human_bytes(total), pct
+
+
+# ------------------------------------------------------------------- assemble
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--refresh":
+        d = fetch_weather()
+        if d:
+            try:
+                with open(CACHE, "w") as f:
+                    f.write(d)
+            except OSError:
+                pass
+        return
+
+    host = os.environ.get("SPLASH_HOST") or socket.gethostname()
+    now = time.localtime()
+    is_night = not (6 <= now.tm_hour < 20)
+
+    wx = read_weather()
+    if wx:
+        emoji, cond, temp, feels, wind, hum, moon = (wx + [""] * 7)[:7]
+        cond = cond.strip()
+        scene = classify(cond, is_night)
+        wx_line1 = f"{cond}  {temp.strip()}  (feels {feels.strip()})"
+        wx_line2 = f"wind {wind.strip()}   hum {hum.strip()}   moon {moon.strip()}"
+    else:
+        scene = "night-clear" if is_night else "day-clear"
+        wx_line1 = "weather offline"
+        wx_line2 = "no network / wttr.in unreachable"
+
+    art = render_scene(scene)
+
+    net, ip = read_network()
+    g4 = read_4g()
+    g4_s = g4 if g4 else "n/a"
+    mem = read_meminfo()
+    mem_s = f"{human_mem(mem[0])} / {human_mem(mem[1])}" if mem else "?"
+    disk = read_disk("/")
+    disk_s = f"{disk[0]} / {disk[1]} ({disk[2]}%)" if disk else "?"
+    bat = read_battery()
+    bat_s = bat[0] if bat else "?"
+    cpu = read_cpu_temp()
+    up = read_uptime()
+    load = read_load()
+    clock = time.strftime("%a %-d %b  %H:%M", now)
+
+    # palette for the text panel
+    C_KEY = fg(110)
+    C_VAL = fg(252)
+    C_HEAD = BOLD + fg(231)
+    C_SUB = fg(244)
+    C_BORD = fg(238)
+
+    def kv(key, val, key2=None, val2=None):
+        s = f"{C_KEY}{key:<5}{RESET}{C_VAL}{val}{RESET}"
+        if key2:
+            s += f"   {C_KEY}{key2:<5}{RESET}{C_VAL}{val2}{RESET}"
+        return s
+
+    # Big block-letter hostname above the frame (skipped if it won't fit).
+    try:
+        term_cols = shutil.get_terminal_size((80, 24)).columns
+    except Exception:
+        term_cols = 80
+    banner = render_banner(host, term_cols - 2)
+
+    if banner:
+        head_line = f"{C_SUB}uConsole · ClockworkPi{RESET}"
+    else:
+        head_line = f"{C_HEAD}{host}{RESET}  {C_SUB}uConsole · ClockworkPi{RESET}"
+
+    def kv3(k1, v1, k2, v2, k3, v3):
+        return (
+            f"{C_KEY}{k1:<5}{RESET}{C_VAL}{v1}{RESET}   "
+            f"{C_KEY}{k2:<5}{RESET}{C_VAL}{v2}{RESET}   "
+            f"{C_KEY}{k3:<5}{RESET}{C_VAL}{v3}{RESET}"
+        )
+
+    panel = [
+        head_line,
+        f"{C_BORD}{'─' * 44}{RESET}",
+        f"{fg(223)}{wx_line1}{RESET}",
+        f"{C_SUB}{wx_line2}{RESET}",
+        kv("net", f"{net}  {ip}"),
+        kv("4g", g4_s),
+        kv("ram", mem_s, "disk", disk_s),
+        kv3("cpu", cpu, "bat", bat_s, "load", load),
+        f"{C_KEY}{'up':<5}{RESET}{C_VAL}{up}{RESET}   {C_SUB}{clock}{RESET}",
+    ]
+
+    # ---- left-anchored open frame (no right border: emoji widths can't be
+    # measured reliably, so we don't pretend to close the box on the right).
+    inner_w = 58
+    top = f"{C_BORD}╭{'─' * inner_w}{RESET}"
+    bot = f"{C_BORD}╰{'─' * inner_w}{RESET}"
+
+    rows = max(ART_H, len(panel))
+    lines = [top]
+    for i in range(rows):
+        left = art[i] if i < len(art) else " " * ART_W
+        text = panel[i] if i < len(panel) else ""
+        body = f"{C_BORD}│{RESET} {left}  {text}"
+        lines.append(body + f"{ESC}K")
+    lines.append(bot)
+
+    print()
+    if banner:
+        for b in banner:
+            print(" " + b)
+        print()
+    for ln in lines:
+        print(" " + ln)
+    print()
+
+
+if __name__ == "__main__":
+    main()

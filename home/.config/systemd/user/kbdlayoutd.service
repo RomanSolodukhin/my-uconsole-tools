@@ -5,7 +5,7 @@ After=default.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/kbdlayoutd --tmux
+ExecStart=%h/.local/bin/kbdlayoutd --tmux --out /run/uconsole/kbdlayout
 Restart=always
 RestartSec=1
 

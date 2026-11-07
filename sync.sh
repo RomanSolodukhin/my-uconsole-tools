@@ -14,7 +14,8 @@ copy ~/.bash_profile  home/.bash_profile
 for f in brightness-status eco-status net-marquee-trigger uconsole-eco \
          network-status cm5-temp battery-status tmux-system-status \
          uconsole-trackball-scroll.py \
-         kbdlayoutd kbd-status uconsole-mode; do
+         kbdlayoutd kbd-status uconsole-mode \
+         volume-control volume-status uconsole-splash; do
   copy ~/.local/bin/"$f" home/.local/bin/"$f"
 done
 

@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Audio control helper for tmux key bindings.
+set -u
+
+uid=${UID:-$(id -u)}
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$uid}"
+
+EVENT="$XDG_RUNTIME_DIR/volume-status-event"
+SINK='@DEFAULT_AUDIO_SINK@'
+PULSE_SINK='@DEFAULT_SINK@'
+STEP='5%'
+LIMIT='1.50'
+
+usage() {
+  echo "usage: volume-control up|down|toggle|mute|unmute|status" >&2
+}
+
+poke_status() {
+  mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
+  printf '%s\t%s\n' "$(date +%s.%N)" "${1:-change}" > "$EVENT" 2>/dev/null || true
+  (
+    i=0
+    while [ "$i" -lt 18 ]; do
+      tmux refresh-client -S 2>/dev/null
+      i=$((i + 1))
+      sleep 0.3
+    done
+    tmux refresh-client -S 2>/dev/null
+  ) >/dev/null 2>&1 &
+}
+
+resume_sink() {
+  pactl suspend-sink "$PULSE_SINK" 0 2>/dev/null || true
+}
+
+suspend_sink() {
+  pactl suspend-sink "$PULSE_SINK" 1 2>/dev/null || true
+}
+
+is_muted() {
+  wpctl get-volume "$SINK" 2>/dev/null | grep -q 'MUTED'
+}
+
+case "${1:-status}" in
+  up)
+    resume_sink
+    wpctl set-mute "$SINK" 0
+    wpctl set-volume -l "$LIMIT" "$SINK" "$STEP+"
+    poke_status up
+    ;;
+  down)
+    resume_sink
+    wpctl set-mute "$SINK" 0
+    wpctl set-volume "$SINK" "$STEP-"
+    poke_status down
+    ;;
+  toggle)
+    if is_muted; then
+      resume_sink
+      wpctl set-mute "$SINK" 0
+      poke_status unmute
+    else
+      wpctl set-mute "$SINK" 1
+      suspend_sink
+      poke_status mute
+    fi
+    ;;
+  mute)
+    wpctl set-mute "$SINK" 1
+    suspend_sink
+    poke_status mute
+    ;;
+  unmute)
+    resume_sink
+    wpctl set-mute "$SINK" 0
+    poke_status unmute
+    ;;
+  status)
+    exec /home/roman/.local/bin/volume-status
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac
