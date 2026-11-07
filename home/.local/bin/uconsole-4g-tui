@@ -1,0 +1,387 @@
+ #!/usr/bin/env bash
+
+ set -u
+
+ TITLE="uConsole 4G"
+ MODEM="any"
+ CYTA_OPERATOR="28001"
+ DEFAULT_DATA_PROFILE="cyta-4g"
+ FALLBACK_DATA_PROFILE="cyta-4g-internet"
+
+ need_cmd() {
+   command -v "$1" >/dev/null 2>&1 || {
+     echo "Missing required command: $1" >&2
+     exit 1
+   }
+ }
+
+ need_cmd whiptail
+ need_cmd mmcli
+ need_cmd nmcli
+ need_cmd uconsole-4g
+
+ show_text() {
+   local title="$1"
+   local text="$2"
+   whiptail --title "$title" --scrolltext --msgbox "$text" 22 78
+ }
+
+ show_cmd() {
+   local title="$1"
+   shift
+   local out
+   out=$("$@" 2>&1) || true
+   [ -n "$out" ] || out="(no output)"
+   show_text "$title" "$out"
+ }
+
+ confirm() {
+   whiptail --title "$TITLE" --yesno "$1" 9 70
+ }
+
+ input_box() {
+   whiptail --title "$1" --inputbox "$2" 9 70 "${3:-}" 3>&1 1>&2 2>&3
+ }
+
+ main_status() {
+   local out
+   out=$({
+     echo "== Modem =="
+     mmcli -m "$MODEM" 2>&1 || true
+     echo
+     echo "== Signal =="
+     mmcli -m "$MODEM" --signal-get 2>&1 || true
+     echo
+     echo "== NetworkManager =="
+     nmcli device status 2>&1 || true
+     echo
+     echo "== Routes =="
+     ip route 2>&1 || true
+   })
+   show_text "Status" "$out"
+ }
+
+ power_menu() {
+   while true; do
+     local choice
+     choice=$(whiptail --title "$TITLE - Power" --menu "4G power/modem actions" 18 72 9 \
+       enable "Power on 4G module" \
+       disable "Power off 4G module" \
+       restart-mm "Restart ModemManager" \
+       reset-modem "Reset modem via ModemManager" \
+       enable-modem "Enable modem via ModemManager" \
+       register "Register home/CYTA network" \
+       back "Back" \
+       3>&1 1>&2 2>&3) || return
+
+     case "$choice" in
+       enable)
+         show_cmd "uconsole-4g enable" uconsole-4g enable
+         ;;
+       disable)
+         if confirm "Power off the 4G module?"; then
+           show_cmd "uconsole-4g disable" uconsole-4g disable
+         fi
+         ;;
+       restart-mm)
+         show_cmd "Restart ModemManager" systemctl restart ModemManager
+         ;;
+       reset-modem)
+         if confirm "Reset the modem? It may require rediscovery/registration."; then
+           show_cmd "Reset modem" mmcli -m "$MODEM" --reset
+         fi
+         ;;
+       enable-modem)
+         show_cmd "Enable modem" mmcli -m "$MODEM" --enable
+         ;;
+       register)
+         show_cmd "Register CYTA" mmcli -m "$MODEM" --3gpp-register-in-operator="$CYTA_OPERATOR"
+         ;;
+       back) return ;;
+     esac
+   done
+ }
+
+ network_menu() {
+   while true; do
+     local choice
+     choice=$(whiptail --title "$TITLE - Network" --menu "Data and registration" 18 72 9 \
+       status "Show modem/network status" \
+       connect "Connect $DEFAULT_DATA_PROFILE" \
+       connect-fallback "Connect $FALLBACK_DATA_PROFILE" \
+       disconnect "Disconnect active 4G profiles" \
+       register "Register CYTA operator" \
+       scan "Scan mobile networks" \
+       back "Back" \
+       3>&1 1>&2 2>&3) || return
+
+     case "$choice" in
+       status) main_status ;;
+       connect)
+         show_cmd "Connect $DEFAULT_DATA_PROFILE" nmcli connection up "$DEFAULT_DATA_PROFILE"
+         ;;
+       connect-fallback)
+         show_cmd "Connect $FALLBACK_DATA_PROFILE" nmcli connection up "$FALLBACK_DATA_PROFILE"
+         ;;
+       disconnect)
+         nmcli connection down "$DEFAULT_DATA_PROFILE" >/tmp/uconsole-4g-tui-nm.out 2>&1 || true
+         nmcli connection down "$FALLBACK_DATA_PROFILE" >>/tmp/uconsole-4g-tui-nm.out 2>&1 || true
+         show_text "Disconnect" "$(cat /tmp/uconsole-4g-tui-nm.out)"
+         ;;
+       register)
+         show_cmd "Register CYTA" mmcli -m "$MODEM" --3gpp-register-in-operator="$CYTA_OPERATOR"
+         ;;
+       scan)
+         show_cmd "Scan networks" mmcli -m "$MODEM" --3gpp-scan
+         ;;
+       back) return ;;
+     esac
+   done
+ }
+
+ sms_list_ids() {
+   mmcli -m "$MODEM" --messaging-list-sms 2>/dev/null | sed -n 's#.*SMS/\([0-9][0-9]*\).*#\1#p' | sort -n
+ }
+
+ sms_read_menu() {
+   local ids=()
+   local id
+   while read -r id; do
+     [ -n "$id" ] && ids+=("$id" "SMS/$id")
+   done < <(sms_list_ids)
+
+   if [ "${#ids[@]}" -eq 0 ]; then
+     show_cmd "SMS" mmcli -m "$MODEM" --messaging-list-sms
+     return
+   fi
+
+   id=$(whiptail --title "$TITLE - SMS" --menu "Select SMS to read" 20 70 12 "${ids[@]}" 3>&1 1>&2 2>&3) || return
+   show_cmd "SMS/$id" mmcli -s "$id"
+ }
+
+ sms_send() {
+   local number text out id
+   number=$(input_box "Send SMS" "Recipient number:" "") || return
+   [ -n "$number" ] || return
+   text=$(input_box "Send SMS" "Message text:" "") || return
+   [ -n "$text" ] || return
+
+   out=$(mmcli -m "$MODEM" --messaging-create-sms="number=$number,text=$text" 2>&1) || {
+     show_text "Create SMS failed" "$out"
+     return
+   }
+   id=$(printf '%s\n' "$out" | sed -n 's#.*SMS/\([0-9][0-9]*\).*#\1#p' | tail -1)
+   if [ -z "$id" ]; then
+     show_text "Create SMS" "$out"
+     return
+   fi
+   show_cmd "Send SMS/$id" mmcli -s "$id" --send
+ }
+
+ sms_delete() {
+   local ids=()
+   local id
+   while read -r id; do
+     [ -n "$id" ] && ids+=("$id" "SMS/$id")
+   done < <(sms_list_ids)
+
+   if [ "${#ids[@]}" -eq 0 ]; then
+     show_text "Delete SMS" "No SMS messages found."
+     return
+   fi
+
+   id=$(whiptail --title "$TITLE - Delete SMS" --menu "Select SMS to delete" 20 70 12 "${ids[@]}" 3>&1 1>&2 2>&3) || return
+   if confirm "Delete SMS/$id?"; then
+     show_cmd "Delete SMS/$id" mmcli -m "$MODEM" --messaging-delete-sms="$id"
+   fi
+ }
+
+ sms_menu() {
+   while true; do
+     local choice
+     choice=$(whiptail --title "$TITLE - SMS" --menu "SMS actions" 18 72 9 \
+       list "List SMS" \
+       read "Read SMS" \
+       send "Send SMS" \
+       delete "Delete SMS" \
+       back "Back" \
+       3>&1 1>&2 2>&3) || return
+
+     case "$choice" in
+       list) show_cmd "SMS list" mmcli -m "$MODEM" --messaging-list-sms ;;
+       read) sms_read_menu ;;
+       send) sms_send ;;
+       delete) sms_delete ;;
+       back) return ;;
+     esac
+   done
+ }
+
+ ussd_menu() {
+   while true; do
+     local choice code response
+     choice=$(whiptail --title "$TITLE - USSD" --menu "USSD actions" 16 72 7 \
+       balance "Send *110#" \
+       custom "Send custom USSD" \
+       status "USSD status" \
+       cancel "Cancel USSD" \
+       back "Back" \
+       3>&1 1>&2 2>&3) || return
+
+     case "$choice" in
+       balance)
+         show_cmd "USSD *110#" mmcli -m "$MODEM" --3gpp-ussd-initiate='*110#'
+         ;;
+       custom)
+         code=$(input_box "USSD" "USSD code:" "*110#") || return
+         [ -n "$code" ] || return
+         show_cmd "USSD $code" mmcli -m "$MODEM" --3gpp-ussd-initiate="$code"
+         ;;
+       status)
+         show_cmd "USSD status" mmcli -m "$MODEM" --3gpp-ussd-status
+         ;;
+       cancel)
+         show_cmd "USSD cancel" mmcli -m "$MODEM" --3gpp-ussd-cancel
+         ;;
+       back) return ;;
+     esac
+   done
+ }
+
+ call_list_ids() {
+   mmcli -m "$MODEM" --voice-list-calls 2>/dev/null | sed -n 's#.*Call/\([0-9][0-9]*\).*#\1#p' | sort -n
+ }
+
+ call_select() {
+   local ids=()
+   local id
+   while read -r id; do
+     [ -n "$id" ] && ids+=("$id" "Call/$id")
+   done < <(call_list_ids)
+
+   if [ "${#ids[@]}" -eq 0 ]; then
+     show_text "Calls" "No calls found."
+     return 1
+   fi
+
+   whiptail --title "$TITLE - Calls" --menu "Select call" 20 70 12 "${ids[@]}" 3>&1 1>&2 2>&3
+ }
+
+ call_make() {
+   local number out id
+   number=$(input_box "Make call" "Number:" "") || return
+   [ -n "$number" ] || return
+   out=$(mmcli -m "$MODEM" --voice-create-call="number=$number" 2>&1) || {
+     show_text "Create call failed" "$out"
+     return
+   }
+   id=$(printf '%s\n' "$out" | sed -n 's#.*Call/\([0-9][0-9]*\).*#\1#p' | tail -1)
+   if [ -z "$id" ]; then
+     show_text "Create call" "$out"
+     return
+   fi
+   show_cmd "Start Call/$id" mmcli -o "$id" --start
+ }
+
+ calls_menu() {
+   while true; do
+     local choice id dtmf
+     choice=$(whiptail --title "$TITLE - Calls" --menu "Voice call actions" 20 72 11 \
+       status "Voice status" \
+       list "List calls" \
+       make "Make call" \
+       show "Show selected call" \
+       accept "Accept selected call" \
+       hangup "Hang up selected call" \
+       hangup-all "Hang up all calls" \
+       dtmf "Send DTMF to selected call" \
+       back "Back" \
+       3>&1 1>&2 2>&3) || return
+
+     case "$choice" in
+       status) show_cmd "Voice status" mmcli -m "$MODEM" --voice-status ;;
+       list) show_cmd "Calls" mmcli -m "$MODEM" --voice-list-calls ;;
+       make) call_make ;;
+       show)
+         id=$(call_select) || continue
+         show_cmd "Call/$id" mmcli -o "$id"
+         ;;
+       accept)
+         id=$(call_select) || continue
+         show_cmd "Accept Call/$id" mmcli -o "$id" --accept
+         ;;
+       hangup)
+         id=$(call_select) || continue
+         show_cmd "Hangup Call/$id" mmcli -o "$id" --hangup
+         ;;
+       hangup-all)
+         if confirm "Hang up all calls?"; then
+           show_cmd "Hangup all" mmcli -m "$MODEM" --voice-hangup-all
+         fi
+         ;;
+       dtmf)
+         id=$(call_select) || continue
+         dtmf=$(input_box "DTMF" "Digits [0-9A-D*#]:" "") || continue
+         [ -n "$dtmf" ] || continue
+         show_cmd "DTMF Call/$id" mmcli -o "$id" --send-dtmf="$dtmf"
+         ;;
+       back) return ;;
+     esac
+   done
+ }
+
+ pin_menu() {
+   while true; do
+     local choice pin
+     choice=$(whiptail --title "$TITLE - SIM/PIN" --menu "SIM actions" 16 72 7 \
+       sim "Show SIM" \
+       disable-pin "Disable PIN request" \
+       enable-pin "Enable PIN request" \
+       back "Back" \
+       3>&1 1>&2 2>&3) || return
+
+     case "$choice" in
+       sim) show_cmd "SIM" mmcli -i any ;;
+       disable-pin)
+         pin=$(input_box "Disable PIN" "Current PIN:" "") || continue
+         [ -n "$pin" ] || continue
+         show_cmd "Disable PIN" mmcli -i any --disable-pin --pin="$pin"
+         ;;
+       enable-pin)
+         pin=$(input_box "Enable PIN" "Current PIN:" "") || continue
+         [ -n "$pin" ] || continue
+         show_cmd "Enable PIN" mmcli -i any --enable-pin --pin="$pin"
+         ;;
+       back) return ;;
+     esac
+   done
+ }
+
+ main_menu() {
+   while true; do
+     local choice
+     choice=$(whiptail --title "$TITLE" --menu "SIMCOM / CYTA control" 22 78 12 \
+       status "Status: modem, signal, routes" \
+       power "Power and registration" \
+       network "Data connection" \
+       sms "SMS list/read/send/delete" \
+       ussd "USSD commands" \
+       calls "Voice calls" \
+       pin "SIM/PIN" \
+       quit "Quit" \
+       3>&1 1>&2 2>&3) || break
+
+     case "$choice" in
+       status) main_status ;;
+       power) power_menu ;;
+       network) network_menu ;;
+       sms) sms_menu ;;
+       ussd) ussd_menu ;;
+       calls) calls_menu ;;
+       pin) pin_menu ;;
+       quit) break ;;
+     esac
+   done
+ }
+
+ main_menu

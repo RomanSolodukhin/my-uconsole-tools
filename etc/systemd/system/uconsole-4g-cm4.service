@@ -1,0 +1,16 @@
+[Unit]
+Description=uConsole Raspberry Pi CM4 4G control daemon
+ConditionFileExecutable=/usr/local/bin/uconsole-4g-cm4.sh
+After=NetworkManager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/uconsole-4g-cm4.sh enable
+ExecStop=/usr/local/bin/uconsole-4g-cm4.sh disable
+
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

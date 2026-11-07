@@ -15,7 +15,8 @@ for f in brightness-status eco-status net-marquee-trigger uconsole-eco \
          network-status cm5-temp battery-status tmux-system-status \
          uconsole-trackball-scroll.py \
          kbdlayoutd kbd-status uconsole-mode \
-         volume-control volume-status uconsole-splash; do
+         volume-control volume-status uconsole-splash \
+         uconsole-4g-tui browser; do
   copy ~/.local/bin/"$f" home/.local/bin/"$f"
 done
 
@@ -26,9 +27,13 @@ copy ~/.config/systemd/user/kbdlayoutd.service \
      home/.config/systemd/user/kbdlayoutd.service
 
 # --- /usr/local/bin (root-owned scripts) ---
-for f in ucon-brightness power-event triggerhappy-watchdog uconsole-powerd uconsole-router tmux-resurrect-save; do
+for f in ucon-brightness power-event triggerhappy-watchdog uconsole-powerd uconsole-router tmux-resurrect-save \
+         uconsole-4g-cm4.sh; do
   copy /usr/local/bin/"$f" usr/local/bin/"$f"
 done
+copy /usr/bin/uconsole-4g usr/local/bin/uconsole-4g
+copy ~/start-gui-browser-once.sh usr/local/bin/uconsole-start-gui-browser-once
+copy ~/gui-clipboard-sync usr/local/bin/gui-clipboard-sync
 
 # --- /etc ---
 copy /etc/uconsole-power.conf                                  etc/uconsole-power.conf
@@ -39,6 +44,7 @@ copy /etc/systemd/system/triggerhappy-watchdog.service       etc/systemd/system/
 copy /etc/systemd/system/uconsole-powerd.service             etc/systemd/system/uconsole-powerd.service
 copy /etc/systemd/system/tmux-resurrect-save.service         etc/systemd/system/tmux-resurrect-save.service
 copy /etc/systemd/system/tmux-resurrect-save.timer           etc/systemd/system/tmux-resurrect-save.timer
+copy /etc/systemd/system/uconsole-4g-cm4.service             etc/systemd/system/uconsole-4g-cm4.service
 copy /etc/NetworkManager/dispatcher.d/90-net-marquee         etc/NetworkManager/dispatcher.d/90-net-marquee
 copy /etc/udev/rules.d/90-power-marquee.rules                etc/udev/rules.d/90-power-marquee.rules
 copy /etc/udev/rules.d/91-triggerhappy-restart.rules        etc/udev/rules.d/91-triggerhappy-restart.rules

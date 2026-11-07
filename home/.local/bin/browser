@@ -1,0 +1,29 @@
+ #!/bin/sh
+ set -eu
+
+ engine=firefox
+ if [ "${1:-}" = "--chromium" ]; then
+   engine=chromium
+   shift
+ fi
+
+ target=${1:-about:blank}
+ me=$(id -un)
+ owner_file=/run/uconsole/gui-browser-owner
+
+ # Reuse the running browser when the graphical session is already active
+ # *and* it's the same user running the same engine (otherwise we'd be
+ # handing another user's browser a new URL, or opening a tab in the
+ # wrong engine's window).
+ if [ -S /tmp/.X11-unix/X1 ]; then
+   owner_line=$(cat "$owner_file" 2>/dev/null || echo "")
+   owner_user=${owner_line%% *}
+   owner_engine=${owner_line#* }
+   if [ "$owner_user" = "$me" ] && [ "$owner_engine" = "$engine" ]; then
+     exec env DISPLAY=:1 HOME="$HOME" "$engine" --new-tab "$target"
+   fi
+   echo "browser: GUI session on :1 is busy (owner: ${owner_user:-unknown}/${owner_engine:-?}); try again later" >&2
+   exit 1
+ fi
+
+exec sudo /usr/bin/startx /usr/local/bin/uconsole-start-gui-browser-once "$engine" "$target" -- :1 vt2

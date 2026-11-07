@@ -1,0 +1,70 @@
+ #!/bin/sh
+ set -eu
+
+ engine=${1:-firefox}
+ target=${2:-about:blank}
+
+ # Whoever ran `sudo startx ...` — this runs as root, so we drop back to them.
+ target_user="${SUDO_USER:-roman}"
+ target_home=$(getent passwd "$target_user" | cut -d: -f6)
+ if [ -z "$target_home" ]; then
+   echo "start-gui-browser-once.sh: unknown user '$target_user'" >&2
+   exit 1
+ fi
+
+ owner_file=/run/uconsole/gui-browser-owner
+ mkdir -p /run/uconsole
+ printf '%s %s\n' "$target_user" "$engine" > "$owner_file"
+
+ openbox &
+ openbox_pid=$!
+ sync_pid=
+
+ cleanup() {
+   rm -f "$owner_file"
+   if [ -n "$sync_pid" ]; then
+     kill "$sync_pid" 2>/dev/null || true
+   fi
+   kill "$openbox_pid" 2>/dev/null || true
+ }
+ trap cleanup EXIT INT TERM
+
+ sleep 1
+
+ xrandr -o "${GUI_ROTATE:-right}" >/dev/null 2>&1 || true
+
+ xhost "+SI:localuser:$target_user" >/dev/null 2>&1 || true
+
+ if command -v xclip >/dev/null 2>&1; then
+    sudo -u "$target_user" env HOME="$target_home" USER="$target_user" LOGNAME="$target_user" DISPLAY="${DISPLAY:-:0}" /usr/local/bin/gui-clipboard-sync &
+   sync_pid=$!
+ fi
+
+ case "$engine" in
+   firefox)
+     sudo -u "$target_user" env \
+       HOME="$target_home" \
+       USER="$target_user" \
+       LOGNAME="$target_user" \
+       DISPLAY="${DISPLAY:-:0}" \
+       LIBGL_ALWAYS_SOFTWARE=1 \
+       MOZ_WEBRENDER=0 \
+       MOZ_X11_EGL=0 \
+       firefox --new-window "$target"
+     ;;
+   chromium)
+     # Chromium (unlike this Firefox build) supports the hybrid/caBLE
+     # QR+Bluetooth flow for phone-based passkeys.
+     sudo -u "$target_user" env \
+       HOME="$target_home" \
+       USER="$target_user" \
+       LOGNAME="$target_user" \
+       DISPLAY="${DISPLAY:-:0}" \
+       LIBGL_ALWAYS_SOFTWARE=1 \
+       chromium --new-window --password-store=basic "$target"
+     ;;
+   *)
+     echo "start-gui-browser-once.sh: unknown engine '$engine'" >&2
+     exit 1
+     ;;
+ esac

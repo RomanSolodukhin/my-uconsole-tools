@@ -66,3 +66,17 @@ docs/uconsole-power-plan.md                               -> design doc
   on boot lives in `home/.bash_profile`.
 
 Kill switch for the economy engine: `sudo systemctl stop uconsole-powerd`.
+
+**4G and one-shot GUI browser**
+- `home/.local/bin/uconsole-4g-tui` (alias `4g-tui`) — whiptail UI for modem power,
+  registration, data connections, SMS, USSD and calls.
+- `usr/local/bin/uconsole-4g` + `uconsole-4g-cm4.sh` — CM4-specific GPIO power control;
+  verify GPIO pins before using it on another uConsole revision.
+- `home/.local/bin/browser` + `usr/local/bin/uconsole-start-gui-browser-once` — start or
+  reuse a single rotated X11 browser session; `gui-clipboard-sync` bridges tmux and X11
+  clipboard while it is running.
+
+The 4G TUI requires `whiptail`, `mmcli`, `nmcli` and a working ModemManager setup.
+The browser helpers require `startx`, Openbox, Firefox or Chromium, `sudo`, and optionally
+`xclip`. The `tweb` launcher is intentionally not included: it belongs to the separate
+`tweb-browser` application tree.

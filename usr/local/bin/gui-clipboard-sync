@@ -1,0 +1,62 @@
+ #!/bin/sh
+ set -u
+
+ DISPLAY=${DISPLAY:-:0}
+ TMUX_SOCKET=${TMUX_SOCKET:-/tmp/tmux-1000/default}
+ INTERVAL=${CLIPBOARD_SYNC_INTERVAL:-1}
+
+ get_tmux() {
+   tmux -S "$TMUX_SOCKET" save-buffer - 2>/dev/null || true
+ }
+
+ set_tmux() {
+   tmux -S "$TMUX_SOCKET" load-buffer - 2>/dev/null || true
+ }
+
+ get_xclip() {
+   DISPLAY="$DISPLAY" xclip -selection clipboard -o 2>/dev/null || true
+ }
+
+ set_xclip() {
+   DISPLAY="$DISPLAY" xclip -selection clipboard 2>/dev/null || true
+ }
+
+ hash_text() {
+   sha256sum | awk '{print $1}'
+ }
+
+ tmux_text=$(get_tmux)
+ x_text=$(get_xclip)
+
+ if [ -n "$tmux_text" ]; then
+   printf '%s' "$tmux_text" | set_xclip
+   x_text=$tmux_text
+ elif [ -n "$x_text" ]; then
+   printf '%s' "$x_text" | set_tmux
+   tmux_text=$x_text
+ fi
+
+ tmux_hash=$(printf '%s' "$tmux_text" | hash_text)
+ x_hash=$(printf '%s' "$x_text" | hash_text)
+
+ while :; do
+   new_tmux=$(get_tmux)
+   new_x=$(get_xclip)
+   new_tmux_hash=$(printf '%s' "$new_tmux" | hash_text)
+   new_x_hash=$(printf '%s' "$new_x" | hash_text)
+
+   if [ "$new_tmux_hash" != "$tmux_hash" ] && [ "$new_tmux_hash" != "$x_hash" ]; then
+     printf '%s' "$new_tmux" | set_xclip
+     x_hash=$new_tmux_hash
+     tmux_hash=$new_tmux_hash
+   elif [ "$new_x_hash" != "$x_hash" ] && [ "$new_x_hash" != "$tmux_hash" ]; then
+     printf '%s' "$new_x" | set_tmux
+     tmux_hash=$new_x_hash
+     x_hash=$new_x_hash
+   else
+     tmux_hash=$new_tmux_hash
+     x_hash=$new_x_hash
+   fi
+
+   sleep "$INTERVAL"
+ done
